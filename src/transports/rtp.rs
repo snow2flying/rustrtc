@@ -34,6 +34,7 @@ pub struct UdpRtpEndpoint {
 pub struct RtpTransport {
     ice_conn: Mutex<Option<Arc<IceConn>>>,
     listeners: Mutex<HashMap<u32, mpsc::Sender<RtpPacket>>>,
+    rtcp_listeners: Mutex<Vec<mpsc::Sender<Vec<RtcpPacket>>>>,
     srtp_session: Mutex<Option<SrtpSession>>,
 }
 
@@ -42,6 +43,7 @@ impl RtpTransport {
         Self {
             ice_conn: Mutex::new(Some(ice_conn)),
             listeners: Mutex::new(HashMap::new()),
+            rtcp_listeners: Mutex::new(Vec::new()),
             srtp_session: Mutex::new(None),
         }
     }
@@ -52,6 +54,10 @@ impl RtpTransport {
 
     pub async fn register_listener(&self, ssrc: u32, sender: mpsc::Sender<RtpPacket>) {
         self.listeners.lock().await.insert(ssrc, sender);
+    }
+
+    pub async fn register_rtcp_listener(&self, sender: mpsc::Sender<Vec<RtcpPacket>>) {
+        self.rtcp_listeners.lock().await.push(sender);
     }
 
     pub async fn send_rtp(&self, packet: &RtpPacket) -> Result<()> {
@@ -73,11 +79,54 @@ impl RtpTransport {
             Err(anyhow::anyhow!("ICE connection not set"))
         }
     }
+
+    pub async fn send_rtcp(&self, packets: &[RtcpPacket]) -> Result<()> {
+        let mut bytes = marshal_rtcp_packets(packets).context("marshal RTCP")?;
+        {
+            let mut session = self.srtp_session.lock().await;
+            if let Some(s) = &mut *session {
+                s.protect_rtcp(&mut bytes)
+                    .map_err(|e| anyhow::anyhow!("SRTCP protect failed: {:?}", e))?;
+            }
+        }
+        if let Some(conn) = &*self.ice_conn.lock().await {
+            debug!("RtpTransport sending {} bytes RTCP via ICE", bytes.len());
+            conn.send(&bytes).await.context("send RTCP via ICE")?;
+            Ok(())
+        } else {
+            warn!("ICE connection not set when sending RTCP");
+            Err(anyhow::anyhow!("ICE connection not set"))
+        }
+    }
 }
 
 #[async_trait]
 impl PacketReceiver for RtpTransport {
     async fn receive(&self, packet: Bytes, _addr: SocketAddr) {
+        if is_rtcp(&packet) {
+            let mut packet_vec = packet.to_vec();
+            {
+                let mut session = self.srtp_session.lock().await;
+                if let Some(s) = &mut *session {
+                    if let Err(e) = s.unprotect_rtcp(&mut packet_vec) {
+                        debug!("SRTCP unprotect failed: {:?}", e);
+                        return;
+                    }
+                }
+            }
+            // Parse RTCP packets
+            if let Ok(packets) = parse_rtcp_packets(&packet_vec) {
+                debug!("Received RTCP packets: {:?}", packets);
+                let listeners = self.rtcp_listeners.lock().await;
+                for listener in listeners.iter() {
+                    let _ = listener.send(packets.clone()).await;
+                }
+            } else {
+                debug!("Failed to parse RTCP packets");
+            }
+            return;
+        }
+
         if let Ok(mut rtp) = RtpPacket::parse(&packet) {
             {
                 let mut session = self.srtp_session.lock().await;

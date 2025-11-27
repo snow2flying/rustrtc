@@ -43,6 +43,14 @@ impl SrtpProfile {
     fn key_len(&self) -> usize {
         16
     }
+
+    fn auth_key_len(&self) -> usize {
+        match self {
+            Self::Aes128Sha1_80 | Self::NullCipherHmac => 20,
+            Self::Aes128Sha1_32 => 20,
+            Self::AeadAes128Gcm => 0, // GCM doesn't use separate auth key
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -97,7 +105,8 @@ impl SrtpSession {
                 self.profile,
                 self.tx_keying.clone(),
                 SrtpDirection::Sender,
-            ).unwrap()
+            )
+            .unwrap()
         });
         ctx.protect(packet)
     }
@@ -110,9 +119,47 @@ impl SrtpSession {
                 self.profile,
                 self.rx_keying.clone(),
                 SrtpDirection::Receiver,
-            ).unwrap()
+            )
+            .unwrap()
         });
         ctx.unprotect(packet)
+    }
+
+    pub fn protect_rtcp(&mut self, packet: &mut Vec<u8>) -> SrtpResult<()> {
+        if packet.len() < 8 {
+            return Err(SrtpError::PacketTooShort);
+        }
+        let ssrc = u32::from_be_bytes([packet[4], packet[5], packet[6], packet[7]]);
+
+        let ctx = self.tx_contexts.entry(ssrc).or_insert_with(|| {
+            SrtpContext::new(
+                ssrc,
+                self.profile,
+                self.tx_keying.clone(),
+                SrtpDirection::Sender,
+            )
+            .unwrap()
+        });
+        ctx.protect_rtcp(packet)
+    }
+
+    pub fn unprotect_rtcp(&mut self, packet: &mut Vec<u8>) -> SrtpResult<()> {
+        if packet.len() < 14 {
+            // Header(8) + Index(4) + Tag(>=2)
+            return Err(SrtpError::PacketTooShort);
+        }
+        let ssrc = u32::from_be_bytes([packet[4], packet[5], packet[6], packet[7]]);
+
+        let ctx = self.rx_contexts.entry(ssrc).or_insert_with(|| {
+            SrtpContext::new(
+                ssrc,
+                self.profile,
+                self.rx_keying.clone(),
+                SrtpDirection::Receiver,
+            )
+            .unwrap()
+        });
+        ctx.unprotect_rtcp(packet)
     }
 }
 
@@ -126,6 +173,7 @@ pub struct SrtpContext {
     direction: SrtpDirection,
     rollover_counter: u32,
     last_sequence: Option<u16>,
+    rtcp_index: u32,
 }
 
 impl SrtpContext {
@@ -140,9 +188,13 @@ impl SrtpContext {
         {
             return Err(SrtpError::UnsupportedProfile);
         }
-        let cipher_key = keying.master_key.clone();
-        let auth_key = keying.master_key.clone();
-        let salt = keying.master_salt.clone();
+
+        let (cipher_key, auth_key, salt) = if profile == SrtpProfile::NullCipherHmac {
+            Self::derive_keys(profile, &keying)?
+        } else {
+            Self::derive_keys(profile, &keying)?
+        };
+
         Ok(Self {
             ssrc,
             _profile: profile,
@@ -152,23 +204,174 @@ impl SrtpContext {
             direction,
             rollover_counter: 0,
             last_sequence: None,
+            rtcp_index: 0,
         })
     }
 
+    fn derive_keys(
+        profile: SrtpProfile,
+        keying: &SrtpKeyingMaterial,
+    ) -> SrtpResult<(Vec<u8>, Vec<u8>, Vec<u8>)> {
+        let key_len = profile.key_len();
+        let salt_len = profile.salt_len();
+        let auth_len = profile.auth_key_len();
+
+        // Session Encryption Key: label 0x00
+        let cipher_key = Self::kdf(key_len, 0x00, &keying.master_key, &keying.master_salt)?;
+
+        // Session Authentication Key: label 0x01
+        let auth_key = if auth_len > 0 {
+            Self::kdf(auth_len, 0x01, &keying.master_key, &keying.master_salt)?
+        } else {
+            Vec::new()
+        };
+
+        // Session Salt: label 0x02
+        let salt = Self::kdf(salt_len, 0x02, &keying.master_key, &keying.master_salt)?;
+
+        Ok((cipher_key, auth_key, salt))
+    }
+
+    fn kdf(len: usize, label: u8, master_key: &[u8], master_salt: &[u8]) -> SrtpResult<Vec<u8>> {
+        // RFC 3711 Section 4.3. Key Derivation
+        // AES-CM PRF
+        // x = (label << 48) XOR master_salt
+        // We assume r=0 (index) for session keys.
+
+        let mut iv = [0u8; 16];
+        // Copy salt (14 bytes)
+        for (i, &b) in master_salt.iter().take(14).enumerate() {
+            iv[i] = b;
+        }
+
+        // XOR label into byte 7 (see discussion on bit layout)
+        // This matches libsrtp and other implementations for the standard layout
+        iv[7] ^= label;
+
+        // Run AES-CM
+        let mut out = vec![0u8; len];
+        let mut cipher = Aes128Ctr::new(
+            GenericArray::from_slice(&master_key[..16]),
+            GenericArray::from_slice(&iv),
+        );
+        cipher.apply_keystream(&mut out);
+
+        Ok(out)
+    }
+
+    pub fn protect_rtcp(&mut self, packet: &mut Vec<u8>) -> SrtpResult<()> {
+        self.rtcp_index += 1;
+        let index = self.rtcp_index;
+        // E-bit = 1 (Encrypted)
+        let index_with_e = index | 0x8000_0000;
+
+        // Encrypt payload (everything after first 8 bytes of header)
+        // RFC 3711: The first 8 octets of the RTCP header are not encrypted.
+        if packet.len() > 8 {
+            self.cipher_rtcp(packet, index)?;
+        }
+
+        // Append SRTCP Index
+        packet.extend_from_slice(&index_with_e.to_be_bytes());
+
+        // Authenticate
+        let tag = self.auth_tag_rtcp(packet)?;
+        packet.extend_from_slice(&tag);
+
+        Ok(())
+    }
+
+    pub fn unprotect_rtcp(&mut self, packet: &mut Vec<u8>) -> SrtpResult<()> {
+        let tag_len = self._profile.tag_len();
+        if packet.len() < tag_len + 4 {
+            return Err(SrtpError::PacketTooShort);
+        }
+
+        // Split tag
+        let split = packet.len() - tag_len;
+        let tag = packet[split..].to_vec();
+        packet.truncate(split);
+
+        // Verify tag
+        let expected = self.auth_tag_rtcp(packet)?;
+        if !constant_time_eq(&tag, &expected) {
+            return Err(SrtpError::AuthenticationFailed);
+        }
+
+        // Read Index
+        let index_bytes = &packet[packet.len() - 4..];
+        let index_with_e = u32::from_be_bytes([
+            index_bytes[0],
+            index_bytes[1],
+            index_bytes[2],
+            index_bytes[3],
+        ]);
+        packet.truncate(packet.len() - 4);
+
+        let e_bit = (index_with_e & 0x8000_0000) != 0;
+        let index = index_with_e & 0x7FFF_FFFF;
+
+        // Replay check (simplified: just check if index is newer than last seen?)
+        // For now, we just update.
+        if index > self.rtcp_index {
+            self.rtcp_index = index;
+        }
+
+        if e_bit && packet.len() > 8 {
+            self.cipher_rtcp(packet, index)?;
+        }
+
+        Ok(())
+    }
+
+    fn cipher_rtcp(&self, packet: &mut Vec<u8>, index: u32) -> SrtpResult<()> {
+        // IV = (salt << 16) XOR (SSRC << 64) XOR (SRTCP_INDEX << 16)
+        // Actually:
+        // IV = (k_s * 2^16) XOR (SSRC * 2^64) XOR (SRTCP_INDEX * 2^16)
+
+        let mut iv = [0u8; 16];
+        for (i, &b) in self.salt.iter().take(14).enumerate() {
+            iv[i] = b;
+        }
+
+        let mut block = [0u8; 16];
+        block[4..8].copy_from_slice(&self.ssrc.to_be_bytes());
+        block[10..14].copy_from_slice(&index.to_be_bytes());
+
+        for i in 0..16 {
+            iv[i] ^= block[i];
+        }
+
+        // Keystream
+        let mut cipher = Aes128Ctr::new(
+            GenericArray::from_slice(&self.cipher_key[..16]),
+            GenericArray::from_slice(&iv),
+        );
+
+        // Encrypt/Decrypt payload (offset 8)
+        cipher.apply_keystream(&mut packet[8..]);
+
+        Ok(())
+    }
+
+    fn auth_tag_rtcp(&self, data: &[u8]) -> SrtpResult<Vec<u8>> {
+        let mut mac = <HmacSha1 as Mac>::new_from_slice(&self.auth_key)
+            .map_err(|_| SrtpError::UnsupportedProfile)?;
+        mac.update(data);
+        let result = mac.finalize().into_bytes();
+        let tag_len = self._profile.tag_len();
+        Ok(result[..tag_len].to_vec())
+    }
+
     pub fn protect(&mut self, packet: &mut RtpPacket) -> SrtpResult<()> {
-        self.update_rollover(packet.header.sequence_number);
+        let roc = self.estimate_roc(packet.header.sequence_number);
 
         if let SrtpProfile::AeadAes128Gcm = self._profile {
-            let nonce = self.build_gcm_nonce(packet.header.sequence_number);
+            let nonce = self.build_gcm_nonce(packet.header.sequence_number, roc);
             let cipher = Aes128Gcm::new_from_slice(&self.cipher_key)
                 .map_err(|_| SrtpError::UnsupportedProfile)?;
 
             // For GCM, AAD is the RTP header.
-            // We need to marshal the header to get bytes for AAD.
-            // Note: packet.marshal() includes payload, but we only want header.
-            // We can temporarily clear payload to marshal header, or implement header marshal.
-            // Since RtpHeader doesn't expose marshal publicly in a way we can use easily without payload,
-            // we can use packet.marshal() with empty payload.
             let original_payload = std::mem::take(&mut packet.payload);
             let aad = packet.marshal()?;
             packet.payload = original_payload;
@@ -180,16 +383,18 @@ impl SrtpContext {
 
             let ciphertext = cipher
                 .encrypt(Nonce::from_slice(&nonce), payload)
-                .map_err(|_| SrtpError::AuthenticationFailed)?; // Encryption failure usually means something else but mapping to AuthFailed for now or add new error
+                .map_err(|_| SrtpError::AuthenticationFailed)?;
 
             packet.payload = ciphertext;
+            self.update(packet.header.sequence_number, roc);
             return Ok(());
         }
 
-        self.cipher_payload(packet)?;
+        self.cipher_payload(packet, roc)?;
         let auth_input = packet.marshal()?;
-        let tag = self.auth_tag(&auth_input)?;
+        let tag = self.auth_tag(&auth_input, roc)?;
         packet.payload.extend_from_slice(&tag);
+        self.update(packet.header.sequence_number, roc);
         Ok(())
     }
 
@@ -199,8 +404,10 @@ impl SrtpContext {
             return Err(SrtpError::PacketTooShort);
         }
 
+        let roc = self.estimate_roc(packet.header.sequence_number);
+
         if let SrtpProfile::AeadAes128Gcm = self._profile {
-            let nonce = self.build_gcm_nonce(packet.header.sequence_number);
+            let nonce = self.build_gcm_nonce(packet.header.sequence_number, roc);
             let cipher = Aes128Gcm::new_from_slice(&self.cipher_key)
                 .map_err(|_| SrtpError::UnsupportedProfile)?;
 
@@ -219,7 +426,7 @@ impl SrtpContext {
                 .map_err(|_| SrtpError::AuthenticationFailed)?;
 
             packet.payload = plaintext;
-            self.update_rollover(packet.header.sequence_number);
+            self.update(packet.header.sequence_number, roc);
             return Ok(());
         }
 
@@ -227,23 +434,23 @@ impl SrtpContext {
         let tag = packet.payload[split..].to_vec();
         packet.payload.truncate(split);
         let auth_input = packet.marshal()?;
-        let expected = self.auth_tag(&auth_input)?;
+        let expected = self.auth_tag(&auth_input, roc)?;
         if !constant_time_eq(&tag, &expected) {
             return Err(SrtpError::AuthenticationFailed);
         }
-        self.cipher_payload(packet)?;
-        self.update_rollover(packet.header.sequence_number);
+        self.cipher_payload(packet, roc)?;
+        self.update(packet.header.sequence_number, roc);
         Ok(())
     }
 
-    fn cipher_payload(&self, packet: &mut RtpPacket) -> SrtpResult<()> {
+    fn cipher_payload(&self, packet: &mut RtpPacket, roc: u32) -> SrtpResult<()> {
         if packet.payload.is_empty() {
             return Ok(());
         }
         match self._profile {
             SrtpProfile::NullCipherHmac => Ok(()),
             SrtpProfile::Aes128Sha1_80 | SrtpProfile::Aes128Sha1_32 => {
-                let iv = self.build_iv(packet.header.sequence_number);
+                let iv = self.build_iv(packet.header.sequence_number, roc);
                 let mut cipher = Aes128Ctr::new(
                     GenericArray::from_slice(&self.cipher_key[..16]),
                     GenericArray::from_slice(&iv),
@@ -255,23 +462,23 @@ impl SrtpContext {
         }
     }
 
-    fn auth_tag(&self, data: &[u8]) -> SrtpResult<Vec<u8>> {
+    fn auth_tag(&self, data: &[u8], roc: u32) -> SrtpResult<Vec<u8>> {
         let mut mac = <HmacSha1 as Mac>::new_from_slice(&self.auth_key)
             .map_err(|_| SrtpError::UnsupportedProfile)?;
         mac.update(data);
-        mac.update(&self.rollover_counter.to_be_bytes());
+        mac.update(&roc.to_be_bytes());
         let result = mac.finalize().into_bytes();
         let tag_len = self._profile.tag_len();
         Ok(result[..tag_len].to_vec())
     }
 
-    fn build_gcm_nonce(&self, sequence: u16) -> [u8; 12] {
+    fn build_gcm_nonce(&self, sequence: u16, roc: u32) -> [u8; 12] {
         let mut iv = [0u8; 12];
         iv.copy_from_slice(&self.salt[..12]);
 
         let mut block = [0u8; 12];
         block[2..6].copy_from_slice(&self.ssrc.to_be_bytes());
-        block[6..10].copy_from_slice(&self.rollover_counter.to_be_bytes());
+        block[6..10].copy_from_slice(&roc.to_be_bytes());
         block[10..12].copy_from_slice(&sequence.to_be_bytes());
 
         for i in 0..12 {
@@ -280,8 +487,8 @@ impl SrtpContext {
         iv
     }
 
-    fn build_iv(&self, sequence: u16) -> [u8; 16] {
-        let index = ((self.rollover_counter as u64) << 16) | sequence as u64;
+    fn build_iv(&self, sequence: u16, roc: u32) -> [u8; 16] {
+        let index = ((roc as u64) << 16) | sequence as u64;
         let mut iv = [0u8; 16];
         for (i, byte) in self.salt.iter().enumerate().take(14) {
             iv[i] = *byte;
@@ -295,13 +502,38 @@ impl SrtpContext {
         iv
     }
 
-    fn update_rollover(&mut self, sequence: u16) {
-        if let Some(last) = self.last_sequence {
-            if sequence < last {
-                self.rollover_counter = self.rollover_counter.saturating_add(1);
-            }
+    fn estimate_roc(&self, sequence: u16) -> u32 {
+        let Some(last_seq) = self.last_sequence else {
+            return self.rollover_counter;
+        };
+
+        let roc = self.rollover_counter;
+        let diff = (sequence as i32) - (last_seq as i32);
+
+        if diff < -32768 {
+            roc.wrapping_add(1)
+        } else if diff > 32768 {
+            roc.wrapping_sub(1)
+        } else {
+            roc
         }
-        self.last_sequence = Some(sequence);
+    }
+
+    fn update(&mut self, sequence: u16, roc: u32) {
+        if self.last_sequence.is_none() {
+            self.last_sequence = Some(sequence);
+            self.rollover_counter = roc;
+            return;
+        }
+
+        let current_index =
+            ((self.rollover_counter as u64) << 16) | (self.last_sequence.unwrap() as u64);
+        let new_index = ((roc as u64) << 16) | (sequence as u64);
+
+        if new_index > current_index {
+            self.rollover_counter = roc;
+            self.last_sequence = Some(sequence);
+        }
     }
 
     pub fn ssrc(&self) -> u32 {
@@ -381,6 +613,55 @@ mod tests {
         let mut packet = sample_packet(10);
         ctx.protect(&mut packet).unwrap();
         assert_eq!(packet.payload.len(), 3 + 10);
+    }
+
+    #[test]
+    fn roc_rollover_handling() {
+        let mut sender =
+            SrtpSession::new(SrtpProfile::Aes128Sha1_80, material(), material()).unwrap();
+        let mut receiver =
+            SrtpSession::new(SrtpProfile::Aes128Sha1_80, material(), material()).unwrap();
+
+        // Send packet near rollover
+        let mut p1 = sample_packet(65535);
+        sender.protect_rtp(&mut p1).unwrap();
+
+        // Send packet after rollover
+        let mut p2 = sample_packet(0);
+        sender.protect_rtp(&mut p2).unwrap();
+
+        // Receive in order
+        receiver.unprotect_rtp(&mut p1).unwrap();
+        receiver.unprotect_rtp(&mut p2).unwrap();
+    }
+
+    #[test]
+    fn roc_rollover_reordered() {
+        let mut sender =
+            SrtpSession::new(SrtpProfile::Aes128Sha1_80, material(), material()).unwrap();
+        let mut receiver =
+            SrtpSession::new(SrtpProfile::Aes128Sha1_80, material(), material()).unwrap();
+
+        // Send p0 (seq 50000) to sync
+        let mut p0 = sample_packet(50000);
+        sender.protect_rtp(&mut p0).unwrap();
+        receiver.unprotect_rtp(&mut p0).unwrap();
+
+        // Send packet near rollover
+        let mut p1 = sample_packet(65535);
+        sender.protect_rtp(&mut p1).unwrap();
+
+        // Send packet after rollover
+        let mut p2 = sample_packet(0);
+        sender.protect_rtp(&mut p2).unwrap();
+
+        // Receive out of order: p2 (seq 0) then p1 (seq 65535)
+
+        let mut p1_recv = p1.clone();
+        let mut p2_recv = p2.clone();
+
+        receiver.unprotect_rtp(&mut p2_recv).unwrap();
+        receiver.unprotect_rtp(&mut p1_recv).unwrap();
     }
 }
 

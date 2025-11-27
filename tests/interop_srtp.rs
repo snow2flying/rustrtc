@@ -20,16 +20,8 @@ async fn test_srtp_interop_loopback() -> Result<()> {
     // 2. Create SRTP Sessions
     // Note: In a real scenario, one is sender, one is receiver, or both.
     // SrtpSession handles both protect (send) and unprotect (recv).
-    let mut tx_session = SrtpSession::new(
-        SrtpProfile::Aes128Sha1_80,
-        km_a.clone(),
-        km_a,
-    )?;
-    let mut rx_session = SrtpSession::new(
-        SrtpProfile::Aes128Sha1_80,
-        km_b.clone(),
-        km_b,
-    )?;
+    let mut tx_session = SrtpSession::new(SrtpProfile::Aes128Sha1_80, km_a.clone(), km_a)?;
+    let mut rx_session = SrtpSession::new(SrtpProfile::Aes128Sha1_80, km_b.clone(), km_b)?;
 
     // 3. Setup UDP Transport
     let socket_a = UdpSocket::bind("127.0.0.1:0").await?;

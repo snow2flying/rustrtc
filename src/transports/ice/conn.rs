@@ -45,27 +45,39 @@ impl IceConn {
 #[async_trait]
 impl PacketReceiver for IceConn {
     async fn receive(&self, packet: Bytes, addr: SocketAddr) {
-        let current_remote = *self.remote_addr.read().await;
-        // If remote_addr is unspecified (port 0), accept and update
-        if current_remote.port() == 0 {
-            *self.remote_addr.write().await = addr;
-        } else if addr != current_remote {
-            // Allow updating remote address if it changes (e.g. peer reflexive)
-            // For now, just update it.
-            // In a real implementation, we should validate this against valid candidates or check ICE state.
-            // But since we are in a single connection state, we can assume the peer might have switched candidates.
-            debug!(
-                "IceConn: Remote address changed from {:?} to {:?}",
-                current_remote, addr
-            );
-            *self.remote_addr.write().await = addr;
-        }
-
         if packet.is_empty() {
             return;
         }
 
         let first_byte = packet[0];
+        let current_remote = *self.remote_addr.read().await;
+
+        // If remote_addr is unspecified (port 0), accept and update
+        if current_remote.port() == 0 {
+            *self.remote_addr.write().await = addr;
+        } else if addr != current_remote {
+            // Only allow updating remote address for DTLS packets (20-63).
+            // We explicitly disallow RTP (128-191) from changing the remote address
+            // to prevent hijacking/race conditions during flooding.
+            // In a full ICE implementation, address changes should be handled via STUN checks.
+            if (20..64).contains(&first_byte) {
+                debug!(
+                    "IceConn: Remote address changed from {:?} to {:?} (DTLS)",
+                    current_remote, addr
+                );
+                *self.remote_addr.write().await = addr;
+            } else {
+                // For RTP, we ignore the address change but still process the packet
+                // (it might be from the valid peer but we haven't switched yet, or it might be junk/attack)
+                // We log at trace level to avoid spamming logs during flood
+                tracing::trace!(
+                    "IceConn: Received packet from new address {:?} but ignoring address change (byte={})",
+                    addr,
+                    first_byte
+                );
+            }
+        }
+
         debug!(
             "IceConn: Received packet from {:?} len={} first_byte={}",
             addr,

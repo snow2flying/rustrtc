@@ -5,13 +5,26 @@ use axum::{
     routing::{get, post},
 };
 use rustrtc::PeerConnection;
+use rustrtc::media::{self, MediaKind as MediaStreamKind, MediaStreamTrack};
 use rustrtc::{RtcConfiguration, SdpType, SessionDescription};
 use serde::{Deserialize, Serialize};
 use std::net::SocketAddr;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::Duration;
 use tower_http::services::ServeDir;
 use tracing::{info, warn};
+use webrtc::peer_connection::configuration::RTCConfiguration;
+use webrtc::peer_connection::sdp::session_description::RTCSessionDescription;
+use webrtc::rtp_transceiver::rtp_receiver::RTCRtpReceiver;
+use webrtc::track::track_local::TrackLocalWriter;
+use webrtc::track::track_local::track_local_static_rtp::TrackLocalStaticRTP;
+use webrtc::{api::APIBuilder, rtp_transceiver::rtp_codec::RTCRtpCodecCapability};
+use webrtc::{api::media_engine::MediaEngine, track::track_remote::TrackRemote};
+use webrtc::{
+    api::{interceptor_registry::register_default_interceptors, media_engine::MIME_TYPE_VP8},
+    rtp_transceiver::RTCRtpTransceiver,
+};
 
 #[tokio::main]
 async fn main() {
@@ -61,20 +74,11 @@ async fn offer(Json(payload): Json<OfferRequest>) -> impl IntoResponse {
 }
 
 async fn handle_webrtc_rs_offer(payload: OfferRequest) -> Json<OfferResponse> {
-    use webrtc::api::APIBuilder;
-    use webrtc::api::interceptor_registry::register_default_interceptors;
-    use webrtc::api::media_engine::MediaEngine;
-    use webrtc::ice_transport::ice_server::RTCIceServer;
-    use webrtc::interceptor::registry::Registry;
-    use webrtc::peer_connection::configuration::RTCConfiguration;
-    use webrtc::peer_connection::sdp::session_description::RTCSessionDescription;
-    use webrtc::track::track_local::track_local_static_rtp::TrackLocalStaticRTP;
-    use webrtc::track::track_local::{TrackLocal, TrackLocalWriter};
-
+    // Create a MediaEngine object to configure the supported codec
     let mut m = MediaEngine::default();
     m.register_default_codecs().unwrap();
 
-    let mut registry = Registry::new();
+    let mut registry = webrtc::interceptor::registry::Registry::new();
     registry = register_default_interceptors(registry, &mut m).unwrap();
 
     let api = APIBuilder::new()
@@ -83,104 +87,90 @@ async fn handle_webrtc_rs_offer(payload: OfferRequest) -> Json<OfferResponse> {
         .build();
 
     let config = RTCConfiguration {
-        ice_servers: vec![RTCIceServer {
-            urls: vec!["stun:stun.l.google.com:19302".to_owned()],
-            ..Default::default()
-        }],
         ..Default::default()
     };
 
     let pc = Arc::new(api.new_peer_connection(config).await.unwrap());
 
-    // Handle DataChannel
-    pc.on_data_channel(Box::new(move |dc| {
-        let dc_label = dc.label().to_owned();
-        let dc_id = dc.id();
-        info!("New DataChannel {} {}", dc_label, dc_id);
-
-        let dc_clone = dc.clone();
-        Box::pin(async move {
-            let dc2 = dc_clone.clone();
-            dc_clone.on_message(Box::new(move |msg| {
-                let msg_data = String::from_utf8_lossy(&msg.data).to_string();
-                info!("Message from DataChannel '{}': '{}'", dc_label, msg_data);
+    // Data Channel Echo
+    let dc = pc.create_data_channel("echo", None).await.unwrap();
+    let dc_clone = dc.clone();
+    let codec = RTCRtpCodecCapability {
+        mime_type: MIME_TYPE_VP8.to_owned(),
+        clock_rate: 90000,
+        channels: 0,
+        ..Default::default()
+    };
+    let video_track = Arc::new(TrackLocalStaticRTP::new(
+        codec,
+        "id".to_string(),
+        "stream_id".to_string(),
+    ));
+    pc.add_track(video_track.clone())
+        .await
+        .expect("add video track");
+    pc.on_track(Box::new(
+        move |track: Arc<TrackRemote>,
+              _receiver: Arc<RTCRtpReceiver>,
+              _transceiver: Arc<RTCRtpTransceiver>| {
+            info!("on_track received: {}", track.codec().capability.mime_type,);
+            let video_track = video_track.clone();
+            Box::pin(async move {
+                loop {
+                    match track.read_rtp().await {
+                        Ok((packet, _)) => {
+                            if let Err(_) = video_track.write_rtp(&packet).await {
+                                break;
+                            }
+                        }
+                        Err(e) => {
+                            info!("track read error: {}", e);
+                            break;
+                        }
+                    }
+                }
+            })
+        },
+    ));
+    dc.on_open(Box::new(move || {
+        info!("Data channel 'echo' opened");
+        let dc2 = dc_clone.clone();
+        dc_clone.on_message(Box::new(
+            move |msg: webrtc::data_channel::data_channel_message::DataChannelMessage| {
+                let msg_data = String::from_utf8_lossy(&msg.data);
+                info!("Received message: {:?}", msg_data);
                 let dc3 = dc2.clone();
+                let data = msg.data.clone();
                 Box::pin(async move {
-                    if let Err(err) = dc3.send(&msg.data).await {
-                        warn!("Failed to send message: {}", err);
+                    if let Err(e) = dc3.send(&data).await {
+                        warn!("Failed to send data: {}", e);
+                    } else {
+                        info!("Sent echo");
                     }
                 })
-            }));
-        })
+            },
+        ));
+        Box::pin(async {})
     }));
 
-    // Handle Track (Video Echo)
-    let pc_clone = pc.clone();
-    pc.on_track(Box::new(move |track, _, _| {
-        let pc2 = pc_clone.clone();
-        Box::pin(async move {
-            if track.kind() == webrtc::rtp_transceiver::rtp_codec::RTPCodecType::Video {
-                info!("Track has started, of type Video");
-                let local_track = Arc::new(TrackLocalStaticRTP::new(
-                    track.codec().capability.clone(),
-                    "video_echo".to_owned(),
-                    "webrtc-rs".to_owned(),
-                ));
+    // Set Remote Description
+    let desc = RTCSessionDescription::offer(payload.sdp.clone()).unwrap();
+    pc.set_remote_description(desc).await.unwrap();
 
-                let rtp_sender = pc2
-                    .add_track(Arc::clone(&local_track) as Arc<dyn TrackLocal + Send + Sync>)
-                    .await
-                    .unwrap();
-
-                // Read RTCP packets sent to this TrackLocal
-                let pc3 = pc2.clone();
-                let media_ssrc = track.ssrc();
-                tokio::spawn(async move {
-                    let mut rtcp_buf = vec![0u8; 1500];
-                    while let Ok((_, _)) = rtp_sender.read(&mut rtcp_buf).await {
-                        if let Err(err) = pc3
-                            .write_rtcp(&[Box::new(
-                                webrtc::rtcp::payload_feedbacks::picture_loss_indication::PictureLossIndication {
-                                    sender_ssrc: 0,
-                                    media_ssrc,
-                                },
-                            )])
-                            .await
-                        {
-                            warn!("Failed to write RTCP PLI: {}", err);
-                        }
-                    }
-                });
-
-                // Read from remote track and write to local track
-                tokio::spawn(async move {
-                    let mut buf = vec![0u8; 1500];
-                    while let Ok((rtp, _)) = track.read(&mut buf).await {
-                        if let Err(err) = local_track.write_rtp(&rtp).await {
-                            warn!("Failed to write RTP: {}", err);
-                        }
-                    }
-                });
-            }
-        })
-    }));
-
-    let offer = RTCSessionDescription::offer(payload.sdp).unwrap();
-    pc.set_remote_description(offer).await.unwrap();
-
+    // Create Answer
     let answer = pc.create_answer(None).await.unwrap();
+
     let mut gather_complete = pc.gathering_complete_promise().await;
     pc.set_local_description(answer).await.unwrap();
     let _ = gather_complete.recv().await;
 
-    let local_desc = pc.local_description().await.unwrap();
+    let answer = pc.local_description().await.unwrap();
 
     Json(OfferResponse {
-        sdp: local_desc.sdp,
+        sdp: answer.sdp,
         type_: "answer".to_string(),
     })
 }
-
 async fn handle_rustrtc_offer(payload: OfferRequest) -> Json<OfferResponse> {
     let config = RtcConfiguration::default();
     let pc = PeerConnection::new(config);
@@ -222,22 +212,7 @@ async fn handle_rustrtc_offer(payload: OfferRequest) -> Json<OfferResponse> {
     let offer_sdp = SessionDescription::parse(SdpType::Offer, &payload.sdp).unwrap();
     pc.set_remote_description(offer_sdp).await.unwrap();
 
-    // Setup video echo
-    let transceivers = pc.get_transceivers().await;
-    for t in transceivers {
-        if t.kind() == rustrtc::MediaKind::Video {
-            t.set_direction(rustrtc::TransceiverDirection::SendRecv)
-                .await;
-            let receiver = t.receiver.lock().await.clone();
-            if let Some(rx) = receiver {
-                let track = rx.track();
-                let sender =
-                    std::sync::Arc::new(rustrtc::peer_connection::RtpSender::new(track, 55555));
-                *t.sender.lock().await = Some(sender);
-                info!("Added video echo");
-            }
-        }
-    }
+    configure_rustrtc_video_echo(&pc).await;
 
     // Create answer and wait for gathering
     let _ = pc.create_answer().await.unwrap();
@@ -259,4 +234,60 @@ async fn handle_rustrtc_offer(payload: OfferRequest) -> Json<OfferResponse> {
         sdp: answer.to_sdp_string(),
         type_: "answer".to_string(),
     })
+}
+
+static VIDEO_SSRC_COUNTER: AtomicU32 = AtomicU32::new(0x0099_0001);
+
+async fn configure_rustrtc_video_echo(pc: &PeerConnection) {
+    let transceivers = pc.get_transceivers().await;
+    for transceiver in transceivers {
+        if transceiver.kind() != rustrtc::MediaKind::Video {
+            continue;
+        }
+
+        transceiver
+            .set_direction(rustrtc::TransceiverDirection::SendRecv)
+            .await;
+
+        let receiver = transceiver.receiver.lock().await.clone();
+        let Some(receiver) = receiver else {
+            warn!("Video transceiver {} missing receiver", transceiver.id());
+            continue;
+        };
+
+        let incoming_track = receiver.track();
+        let (sample_source, outgoing_track) = media::sample_track(MediaStreamKind::Video, 120);
+
+        let sender = Arc::new(rustrtc::peer_connection::RtpSender::new(
+            outgoing_track.clone(),
+            next_video_ssrc(),
+        ));
+        *transceiver.sender.lock().await = Some(sender);
+
+        tokio::spawn(async move {
+            loop {
+                match incoming_track.recv().await {
+                    Ok(sample) => {
+                        if let Err(err) = sample_source.send(sample).await {
+                            warn!("Video echo forwarder stopped: {}", err);
+                            break;
+                        }
+                    }
+                    Err(err) => {
+                        warn!("Video ingress track ended: {}", err);
+                        break;
+                    }
+                }
+            }
+        });
+
+        info!(
+            "Configured RustRTC video echo on transceiver {}",
+            transceiver.id()
+        );
+    }
+}
+
+fn next_video_ssrc() -> u32 {
+    VIDEO_SSRC_COUNTER.fetch_add(1, Ordering::Relaxed)
 }
