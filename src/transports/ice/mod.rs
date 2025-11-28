@@ -2,8 +2,10 @@ pub mod conn;
 pub mod stun;
 #[cfg(test)]
 mod tests;
+pub mod turn;
 
 use crate::transports::PacketReceiver;
+use crate::transports::ice::turn::{TurnClient, TurnCredentials};
 use bytes::Bytes;
 use std::collections::{HashMap, HashSet};
 use std::net::{IpAddr, SocketAddr};
@@ -11,9 +13,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{Context, Result, anyhow, bail};
-use md5::{Digest as Md5Digest, Md5};
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::{TcpStream, UdpSocket, lookup_host};
+use tokio::net::{UdpSocket, lookup_host};
 use tokio::sync::{Mutex, oneshot, watch};
 use tokio::time::timeout;
 use tracing::{debug, instrument, trace, warn};
@@ -21,11 +21,10 @@ use tracing::{debug, instrument, trace, warn};
 use self::stun::{
     StunAttribute, StunClass, StunDecoded, StunMessage, StunMethod, random_bytes, random_u64,
 };
-use crate::{IceCredentialType, IceServer, RtcConfiguration};
+use crate::{IceServer, RtcConfiguration};
 
-const STUN_TIMEOUT: Duration = Duration::from_secs(3);
-const MAX_STUN_MESSAGE: usize = 1500;
-const DEFAULT_TURN_LIFETIME: u32 = 600;
+pub(crate) const STUN_TIMEOUT: Duration = Duration::from_secs(3);
+pub(crate) const MAX_STUN_MESSAGE: usize = 1500;
 
 #[derive(Debug, Clone)]
 pub struct IceTransport {
@@ -181,7 +180,7 @@ impl IceTransport {
         Ok(())
     }
 
-    pub async fn stop(&self) {
+    pub fn stop(&self) {
         let _ = self.inner.state.send(IceTransportState::Closed);
     }
 
@@ -342,20 +341,14 @@ impl IceTransport {
         inner: &Arc<IceTransportInner>,
         client: &Arc<Mutex<TurnClient>>,
     ) {
-        if let Ok(msg) = StunMessage::decode(packet) {
-            if msg.class == StunClass::Indication && msg.method == StunMethod::Data {
-                if let Some(data) = &msg.data {
-                    if let Some(peer_addr) = msg.xor_peer_address {
-                        handle_packet(
-                            data,
-                            peer_addr,
-                            inner.clone(),
-                            IceSocketWrapper::Turn(client.clone()),
-                        )
-                        .await;
-                    }
-                }
-            }
+        if let Ok(msg) = StunMessage::decode(packet) && msg.class == StunClass::Indication && msg.method == StunMethod::Data && let Some(data) = &msg.data && let Some(peer_addr) = msg.xor_peer_address {
+            handle_packet(
+                data,
+                peer_addr,
+                inner.clone(),
+                IceSocketWrapper::Turn(client.clone()),
+            )
+            .await;
         }
     }
 }
@@ -473,7 +466,6 @@ async fn handle_packet(
     inner: Arc<IceTransportInner>,
     sender: IceSocketWrapper,
 ) {
-    trace!("Received packet from {} len={}", addr, packet.len());
     let b = packet[0];
     if b < 2 {
         // STUN
@@ -523,11 +515,6 @@ async fn handle_packet(
             let mut buffer = inner.buffered_packets.lock().await;
             if buffer.len() < 100 {
                 buffer.push((packet.to_vec(), addr));
-                trace!(
-                    "Buffered packet from {} (buffer size: {})",
-                    addr,
-                    buffer.len()
-                );
             } else {
                 warn!("Buffer full, dropping packet from {}", addr);
             }
@@ -545,11 +532,6 @@ async fn handle_stun_request(
 
     let local_params = inner.local_parameters.lock().await;
     let password = &local_params.password;
-
-    trace!(
-        "Handling STUN Request from {}, sending response with password {}",
-        addr, password
-    );
     if let Ok(bytes) = response.encode(Some(password.as_bytes()), true) {
         match sender.send_to(&bytes, addr).await {
             Ok(_) => trace!("Sent STUN Response to {}", addr),
@@ -1044,9 +1026,8 @@ impl IceGatherer {
         }
 
         // 2. LAN IP
-        if let Ok(ip) = get_local_ip().await {
-            if !ip.is_loopback() {
-                match UdpSocket::bind(SocketAddr::new(ip, 0)).await {
+        if let Ok(ip) = get_local_ip().await && !ip.is_loopback() {
+            match UdpSocket::bind(SocketAddr::new(ip, 0)).await {
                     Ok(socket) => {
                         if let Ok(addr) = socket.local_addr() {
                             self.sockets.lock().await.push(Arc::new(socket));
@@ -1056,7 +1037,6 @@ impl IceGatherer {
                     Err(e) => warn!("Failed to bind LAN socket on {}: {}", ip, e),
                 }
             }
-        }
 
         Ok(())
     }
@@ -1145,7 +1125,7 @@ impl IceGatherer {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-struct IceServerUri {
+pub(crate) struct IceServerUri {
     kind: IceUriKind,
     host: String,
     port: u16,
@@ -1170,14 +1150,12 @@ impl IceServerUri {
         let mut transport = default_transport_for_scheme(scheme)?;
         if !query.is_empty() {
             for pair in query.split('&') {
-                if let Some((k, v)) = pair.split_once('=') {
-                    if k == "transport" {
-                        transport = match v.to_ascii_lowercase().as_str() {
-                            "udp" => IceTransportProtocol::Udp,
-                            "tcp" => IceTransportProtocol::Tcp,
-                            other => bail!("unsupported transport {}", other),
-                        };
-                    }
+                if let Some((k, v)) = pair.split_once('=') && k == "transport" {
+                    transport = match v.to_ascii_lowercase().as_str() {
+                        "udp" => IceTransportProtocol::Udp,
+                        "tcp" => IceTransportProtocol::Tcp,
+                        other => bail!("unsupported transport {}", other),
+                    };
                 }
             }
         }
@@ -1222,7 +1200,7 @@ enum IceUriKind {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum IceTransportProtocol {
+pub(crate) enum IceTransportProtocol {
     Udp,
     Tcp,
 }
@@ -1250,376 +1228,6 @@ fn default_transport_for_scheme(scheme: &str) -> Result<IceTransportProtocol> {
         "stuns" | "turns" => IceTransportProtocol::Tcp,
         other => bail!("unsupported scheme {}", other),
     })
-}
-
-#[derive(Debug, Clone)]
-struct TurnCredentials {
-    username: String,
-    password: String,
-}
-
-impl TurnCredentials {
-    fn from_server(server: &IceServer) -> Result<Self> {
-        if server.credential_type != IceCredentialType::Password {
-            bail!("only password credentials supported for TURN");
-        }
-        let username = server
-            .username
-            .clone()
-            .ok_or_else(|| anyhow!("TURN server missing username"))?;
-        let password = server
-            .credential
-            .clone()
-            .ok_or_else(|| anyhow!("TURN server missing credential"))?;
-        Ok(Self { username, password })
-    }
-}
-
-use tokio::net::tcp::{OwnedReadHalf, OwnedWriteHalf};
-
-#[derive(Debug)]
-pub struct TurnClient {
-    transport: TurnTransport,
-    auth: Mutex<Option<TurnAuthState>>,
-}
-
-#[derive(Clone, Debug)]
-#[cfg_attr(not(test), allow(dead_code))]
-struct TurnAuthState {
-    username: String,
-    password: String,
-    realm: String,
-    nonce: String,
-    key: Vec<u8>,
-}
-
-#[cfg_attr(not(test), allow(dead_code))]
-impl TurnAuthState {
-    fn with_key(
-        username: String,
-        password: String,
-        realm: String,
-        nonce: String,
-        key: Vec<u8>,
-    ) -> Self {
-        Self {
-            username,
-            password,
-            realm,
-            nonce,
-            key,
-        }
-    }
-
-    #[cfg_attr(not(test), allow(dead_code))]
-    fn update_nonce(&mut self, realm: String, nonce: String) {
-        self.realm = realm;
-        self.nonce = nonce;
-        self.key = long_term_key(&self.username, &self.realm, &self.password);
-    }
-}
-
-impl TurnClient {
-    async fn connect(uri: &IceServerUri, disable_ipv6: bool) -> Result<Self> {
-        let addr = uri.resolve(disable_ipv6).await?;
-        let transport = match uri.transport {
-            IceTransportProtocol::Udp => {
-                let socket = Arc::new(UdpSocket::bind("0.0.0.0:0").await?);
-                TurnTransport::Udp {
-                    socket,
-                    server: addr,
-                }
-            }
-            IceTransportProtocol::Tcp => {
-                let stream = TcpStream::connect(addr).await?;
-                let (read, write) = stream.into_split();
-                TurnTransport::Tcp {
-                    read: Arc::new(Mutex::new(read)),
-                    write: Arc::new(Mutex::new(write)),
-                }
-            }
-        };
-        Ok(Self {
-            transport,
-            auth: Mutex::new(None),
-        })
-    }
-
-    async fn allocate(&self, creds: TurnCredentials) -> Result<TurnAllocation> {
-        *self.auth.lock().await = None;
-        let mut nonce_info: Option<TurnNonce> = None;
-        let mut attempt = 0;
-        loop {
-            attempt += 1;
-            if attempt > 3 {
-                bail!("TURN allocation failed after retries");
-            }
-            let tx_id = random_bytes::<12>();
-            let attrs = vec![
-                StunAttribute::RequestedTransport(17),
-                StunAttribute::Lifetime(DEFAULT_TURN_LIFETIME),
-            ];
-            let (message, key_option) = if let Some(info) = &nonce_info {
-                let key = long_term_key(&creds.username, &info.realm, &creds.password);
-                let mut extended = attrs.clone();
-                extended.push(StunAttribute::Username(creds.username.clone()));
-                extended.push(StunAttribute::Realm(info.realm.clone()));
-                extended.push(StunAttribute::Nonce(info.nonce.clone()));
-                let msg = StunMessage::allocate_request(tx_id, extended);
-                (msg, Some(key))
-            } else {
-                (StunMessage::allocate_request(tx_id, attrs.clone()), None)
-            };
-            let used_key = key_option.clone();
-            let bytes = message.encode(key_option.as_deref(), true)?;
-            self.send(&bytes).await?;
-            let mut buf = [0u8; MAX_STUN_MESSAGE];
-            let len = self.recv(&mut buf).await?;
-            let parsed = StunMessage::decode(&buf[..len])?;
-            if parsed.transaction_id != tx_id {
-                continue;
-            }
-            if parsed.method != StunMethod::Allocate {
-                bail!("unexpected STUN method in allocate response");
-            }
-            match parsed.class {
-                StunClass::SuccessResponse => {
-                    if let Some(relayed) = parsed.xor_relayed_address {
-                        if let (Some(info), Some(key)) = (nonce_info.clone(), used_key) {
-                            *self.auth.lock().await = Some(TurnAuthState::with_key(
-                                creds.username.clone(),
-                                creds.password.clone(),
-                                info.realm,
-                                info.nonce,
-                                key,
-                            ));
-                        }
-                        return Ok(TurnAllocation {
-                            relayed_address: relayed,
-                            transport: self.transport.protocol(),
-                        });
-                    }
-                    bail!("TURN success without relayed address");
-                }
-                StunClass::ErrorResponse => {
-                    if parsed.error_code == Some(401) || parsed.error_code == Some(438) {
-                        let realm = parsed
-                            .realm
-                            .clone()
-                            .ok_or_else(|| anyhow!("TURN error missing realm"))?;
-                        let nonce = parsed
-                            .nonce
-                            .clone()
-                            .ok_or_else(|| anyhow!("TURN error missing nonce"))?;
-                        nonce_info = Some(TurnNonce { realm, nonce });
-                        continue;
-                    }
-                    bail!("TURN allocate error {}", parsed.error_code.unwrap_or(0));
-                }
-                _ => bail!("unexpected TURN response class"),
-            }
-        }
-    }
-
-    #[cfg_attr(not(test), allow(dead_code))]
-    async fn create_permission(&self, peer: SocketAddr) -> Result<()> {
-        const MAX_ATTEMPTS: usize = 3;
-        for _ in 0..MAX_ATTEMPTS {
-            let tx_id = random_bytes::<12>();
-            let bytes = {
-                let auth_guard = self.auth.lock().await;
-                let auth = auth_guard
-                    .as_ref()
-                    .ok_or_else(|| anyhow!("TURN allocation missing auth context"))?;
-                let mut attributes = vec![StunAttribute::Username(auth.username.clone())];
-                attributes.push(StunAttribute::Realm(auth.realm.clone()));
-                attributes.push(StunAttribute::Nonce(auth.nonce.clone()));
-                attributes.push(StunAttribute::XorPeerAddress(peer));
-                let msg = StunMessage {
-                    class: StunClass::Request,
-                    method: StunMethod::CreatePermission,
-                    transaction_id: tx_id,
-                    attributes,
-                };
-                msg.encode(Some(&auth.key), true)?
-            };
-            self.send(&bytes).await?;
-            let mut buf = [0u8; MAX_STUN_MESSAGE];
-            let len = self.recv(&mut buf).await?;
-            let parsed = StunMessage::decode(&buf[..len])?;
-            if parsed.transaction_id != tx_id {
-                continue;
-            }
-            if parsed.method != StunMethod::CreatePermission {
-                bail!("unexpected STUN method in create-permission response");
-            }
-            match parsed.class {
-                StunClass::SuccessResponse => return Ok(()),
-                StunClass::ErrorResponse => {
-                    if parsed.error_code == Some(401) || parsed.error_code == Some(438) {
-                        let realm = parsed
-                            .realm
-                            .clone()
-                            .ok_or_else(|| anyhow!("TURN error missing realm"))?;
-                        let nonce = parsed
-                            .nonce
-                            .clone()
-                            .ok_or_else(|| anyhow!("TURN error missing nonce"))?;
-                        if let Some(state) = self.auth.lock().await.as_mut() {
-                            state.update_nonce(realm, nonce);
-                        }
-                        continue;
-                    }
-                    bail!(
-                        "TURN create-permission error {}",
-                        parsed.error_code.unwrap_or(0)
-                    );
-                }
-                _ => bail!("unexpected TURN response class"),
-            }
-        }
-        bail!("TURN create-permission failed after retries");
-    }
-
-    pub(crate) async fn send(&self, data: &[u8]) -> Result<()> {
-        match &self.transport {
-            TurnTransport::Udp { socket, server } => {
-                socket.send_to(data, *server).await?;
-            }
-            TurnTransport::Tcp { write, .. } => {
-                let mut frame = Vec::with_capacity(2 + data.len());
-                frame.extend_from_slice(&(data.len() as u16).to_be_bytes());
-                frame.extend_from_slice(data);
-                write.lock().await.write_all(&frame).await?;
-            }
-        }
-        Ok(())
-    }
-
-    async fn recv(&self, buf: &mut [u8]) -> Result<usize> {
-        match &self.transport {
-            TurnTransport::Udp { socket, .. } => {
-                let (len, _) = timeout(STUN_TIMEOUT, socket.recv_from(buf)).await??;
-                Ok(len)
-            }
-            TurnTransport::Tcp { read, .. } => {
-                let mut header = [0u8; 2];
-                let mut stream = read.lock().await;
-                stream.read_exact(&mut header).await?;
-                let len = u16::from_be_bytes(header) as usize;
-                let mut offset = 0;
-                while offset < len {
-                    let read = stream.read(&mut buf[offset..len]).await?;
-                    if read == 0 {
-                        bail!("TURN TCP stream closed");
-                    }
-                    offset += read;
-                }
-                Ok(len)
-            }
-        }
-    }
-
-    async fn send_indication(&self, peer: SocketAddr, data: &[u8]) -> Result<()> {
-        let tx_id = random_bytes::<12>();
-        let mut attributes = vec![StunAttribute::XorPeerAddress(peer)];
-        attributes.push(StunAttribute::Data(data.to_vec()));
-
-        let msg = StunMessage {
-            class: StunClass::Indication,
-            method: StunMethod::Send,
-            transaction_id: tx_id,
-            attributes,
-        };
-
-        let bytes = {
-            let auth_guard = self.auth.lock().await;
-            if let Some(auth) = auth_guard.as_ref() {
-                let mut authenticated_msg = msg.clone();
-                authenticated_msg
-                    .attributes
-                    .insert(0, StunAttribute::Username(auth.username.clone()));
-                authenticated_msg
-                    .attributes
-                    .insert(1, StunAttribute::Realm(auth.realm.clone()));
-                authenticated_msg
-                    .attributes
-                    .insert(2, StunAttribute::Nonce(auth.nonce.clone()));
-                authenticated_msg.encode(Some(&auth.key), true)?
-            } else {
-                msg.encode(None, false)?
-            }
-        };
-
-        self.send(&bytes).await
-    }
-
-    async fn create_permission_packet(&self, peer: SocketAddr) -> Result<(Vec<u8>, [u8; 12])> {
-        let tx_id = random_bytes::<12>();
-        let auth_guard = self.auth.lock().await;
-        let auth = auth_guard.as_ref().ok_or_else(|| anyhow!("no auth"))?;
-
-        let mut attributes = vec![StunAttribute::Username(auth.username.clone())];
-        attributes.push(StunAttribute::Realm(auth.realm.clone()));
-        attributes.push(StunAttribute::Nonce(auth.nonce.clone()));
-        attributes.push(StunAttribute::XorPeerAddress(peer));
-
-        let msg = StunMessage {
-            class: StunClass::Request,
-            method: StunMethod::CreatePermission,
-            transaction_id: tx_id,
-            attributes,
-        };
-        let bytes = msg.encode(Some(&auth.key), true)?;
-        Ok((bytes, tx_id))
-    }
-}
-
-#[derive(Clone)]
-struct TurnNonce {
-    realm: String,
-    nonce: String,
-}
-
-#[derive(Clone)]
-struct TurnAllocation {
-    relayed_address: SocketAddr,
-    transport: IceTransportProtocol,
-}
-
-impl TurnTransport {
-    fn protocol(&self) -> IceTransportProtocol {
-        match self {
-            TurnTransport::Udp { .. } => IceTransportProtocol::Udp,
-            TurnTransport::Tcp { .. } => IceTransportProtocol::Tcp,
-        }
-    }
-}
-
-#[derive(Debug, Clone)]
-enum TurnTransport {
-    Udp {
-        socket: Arc<UdpSocket>,
-        server: SocketAddr,
-    },
-    Tcp {
-        read: Arc<Mutex<OwnedReadHalf>>,
-        write: Arc<Mutex<OwnedWriteHalf>>,
-    },
-}
-
-fn long_term_key(username: &str, realm: &str, password: &str) -> Vec<u8> {
-    let input = format!("{}:{}:{}", username, realm, password);
-    md5_digest(input.as_bytes()).to_vec()
-}
-
-fn md5_digest(input: &[u8]) -> [u8; 16] {
-    let mut hasher = Md5::new();
-    Md5Digest::update(&mut hasher, input);
-    let result = Md5Digest::finalize(hasher);
-    let mut out = [0u8; 16];
-    out.copy_from_slice(&result);
-    out
 }
 
 fn hex_encode(bytes: &[u8]) -> String {

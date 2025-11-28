@@ -4,15 +4,15 @@ use anyhow::Result;
 use async_trait::async_trait;
 use bytes::Bytes;
 use std::net::SocketAddr;
-use std::sync::Arc;
+use std::sync::{Arc, Weak};
 use tokio::sync::{RwLock, watch};
 use tracing::{debug, warn};
 
 pub struct IceConn {
     pub socket_rx: watch::Receiver<Option<IceSocketWrapper>>,
     pub remote_addr: RwLock<SocketAddr>,
-    pub dtls_receiver: RwLock<Option<Arc<dyn PacketReceiver>>>,
-    pub rtp_receiver: RwLock<Option<Arc<dyn PacketReceiver>>>,
+    pub dtls_receiver: RwLock<Option<Weak<dyn PacketReceiver>>>,
+    pub rtp_receiver: RwLock<Option<Weak<dyn PacketReceiver>>>,
 }
 
 impl IceConn {
@@ -29,11 +29,11 @@ impl IceConn {
     }
 
     pub async fn set_dtls_receiver(&self, receiver: Arc<dyn PacketReceiver>) {
-        *self.dtls_receiver.write().await = Some(receiver);
+        *self.dtls_receiver.write().await = Some(Arc::downgrade(&receiver));
     }
 
     pub async fn set_rtp_receiver(&self, receiver: Arc<dyn PacketReceiver>) {
-        *self.rtp_receiver.write().await = Some(receiver);
+        *self.rtp_receiver.write().await = Some(Arc::downgrade(&receiver));
     }
 
     pub async fn send(&self, buf: &[u8]) -> Result<usize> {
@@ -82,11 +82,6 @@ impl PacketReceiver for IceConn {
         }
 
         let first_byte = packet[0];
-        tracing::trace!(
-            "IceConn: receive packet len={} first_byte={}",
-            packet.len(),
-            first_byte
-        );
         let current_remote = *self.remote_addr.read().await;
 
         // If remote_addr is unspecified (port 0), accept and update
@@ -118,14 +113,16 @@ impl PacketReceiver for IceConn {
         if (20..64).contains(&first_byte) {
             // DTLS
             if let Some(rx) = &*self.dtls_receiver.read().await {
-                rx.receive(packet, addr).await;
+                if let Some(strong_rx) = rx.upgrade() {
+                    strong_rx.receive(packet, addr).await;
+                }
             } else {
                 warn!("IceConn: Received DTLS packet but no receiver registered");
             }
         } else if (128..192).contains(&first_byte) {
             // RTP / RTCP
-            if let Some(rx) = &*self.rtp_receiver.read().await {
-                rx.receive(packet, addr).await;
+            if let Some(rx) = &*self.rtp_receiver.read().await && let Some(strong_rx) = rx.upgrade() {
+                strong_rx.receive(packet, addr).await;
             }
         }
     }

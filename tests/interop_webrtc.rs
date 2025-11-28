@@ -22,9 +22,7 @@ async fn interop_ice_dtls_handshake() -> Result<()> {
     let rust_pc = PeerConnection::new(rust_config);
 
     // Add a transceiver to trigger ICE gathering
-    rust_pc
-        .add_transceiver(MediaKind::Audio, TransceiverDirection::SendRecv)
-        .await;
+    rust_pc.add_transceiver(MediaKind::Audio, TransceiverDirection::SendRecv);
 
     // 2. Create WebRTC PeerConnection (Answerer)
     let mut m = MediaEngine::default();
@@ -53,7 +51,7 @@ async fn interop_ice_dtls_handshake() -> Result<()> {
 
     let offer = rust_pc.create_offer().await?;
     println!("RustRTC Offer SDP:\n{}", offer.to_sdp_string());
-    rust_pc.set_local_description(offer.clone()).await?;
+    rust_pc.set_local_description(offer.clone())?;
 
     // Convert RustRTC SDP to WebRTC SDP
     let offer_sdp = offer.to_sdp_string();
@@ -80,34 +78,29 @@ async fn interop_ice_dtls_handshake() -> Result<()> {
     rust_pc.set_remote_description(rust_answer).await?;
 
     // 7. Wait for connection
+    rust_pc.wait_for_connection().await?;
+
     let (done_tx, mut done_rx) = tokio::sync::mpsc::channel::<()>(1);
     let done_tx = Arc::new(done_tx);
 
+    let done_tx_clone = done_tx.clone();
     webrtc_pc.on_peer_connection_state_change(Box::new(move |s: RTCPeerConnectionState| {
         if s == RTCPeerConnectionState::Connected {
-            let _ = done_tx.try_send(());
+            let _ = done_tx_clone.try_send(());
         }
         Box::pin(async {})
     }));
 
-    // Also check RustRTC state
-    let rust_pc_clone = rust_pc.clone();
-    tokio::spawn(async move {
-        loop {
-            let _state = rust_pc_clone.signaling_state().await; // This is signaling, we want connection state
-            // But PeerConnection exposes ice_transport state via subscription
-            // Or we can check internal state if exposed.
-            // For now, let's rely on WebRTC side reporting connected, which implies RustRTC side worked.
-            tokio::time::sleep(Duration::from_millis(100)).await;
-        }
-    });
+    if webrtc_pc.connection_state() == RTCPeerConnectionState::Connected {
+        let _ = done_tx.try_send(());
+    }
 
     timeout(Duration::from_secs(10), done_rx.recv())
         .await?
         .ok_or_else(|| anyhow::anyhow!("Connection timed out"))?;
 
     // Cleanup
-    rust_pc.close().await;
+    rust_pc.close();
     webrtc_pc.close().await?;
 
     Ok(())
@@ -125,16 +118,14 @@ async fn interop_vp8_echo() -> Result<()> {
     let rust_pc = PeerConnection::new(rust_config);
 
     // Add a transceiver for Video
-    let transceiver = rust_pc
-        .add_transceiver(MediaKind::Video, TransceiverDirection::SendRecv)
-        .await;
+    let transceiver = rust_pc.add_transceiver(MediaKind::Video, TransceiverDirection::SendRecv);
 
     // Create a sample track to send data
     let (source, track) = rustrtc::media::sample_track(rustrtc::media::MediaKind::Video, 10);
     let sender = Arc::new(rustrtc::peer_connection::RtpSender::new(
         track, 12345, // SSRC
     ));
-    *transceiver.sender.lock().await = Some(sender);
+    *transceiver.sender.lock().unwrap() = Some(sender);
 
     // 2. Create WebRTC PeerConnection (Answerer)
     let mut m = MediaEngine::default();
@@ -205,7 +196,7 @@ async fn interop_vp8_echo() -> Result<()> {
     }
 
     let offer = rust_pc.create_offer().await?;
-    rust_pc.set_local_description(offer.clone()).await?;
+    rust_pc.set_local_description(offer.clone())?;
 
     // Convert RustRTC SDP to WebRTC SDP
     let offer_sdp = offer.to_sdp_string();
@@ -229,6 +220,9 @@ async fn interop_vp8_echo() -> Result<()> {
     // 6. RustRTC sets Remote Description
     rust_pc.set_remote_description(rust_answer).await?;
 
+    // Wait for connection
+    rust_pc.wait_for_connection().await?;
+
     // 7. Start sending data from RustRTC
     let source_clone = source.clone();
     tokio::spawn(async move {
@@ -250,7 +244,7 @@ async fn interop_vp8_echo() -> Result<()> {
     });
 
     // 8. Verify Echo on RustRTC
-    let receiver = transceiver.receiver.lock().await.clone().unwrap();
+    let receiver = transceiver.receiver.lock().unwrap().clone().unwrap();
     let track = receiver.track();
 
     let mut received_count = 0;
@@ -288,7 +282,7 @@ async fn interop_vp8_echo() -> Result<()> {
     assert!(received_indices.len() >= 10);
 
     // Cleanup
-    rust_pc.close().await;
+    rust_pc.close();
     webrtc_pc.close().await?;
 
     Ok(())
@@ -307,16 +301,14 @@ async fn interop_vp8_echo_with_pli() -> Result<()> {
     let rust_pc = PeerConnection::new(rust_config);
 
     // Add a transceiver for Video
-    let transceiver = rust_pc
-        .add_transceiver(MediaKind::Video, TransceiverDirection::SendRecv)
-        .await;
+    let transceiver = rust_pc.add_transceiver(MediaKind::Video, TransceiverDirection::SendRecv);
 
     // Create a sample track to send data
     let (source, track) = rustrtc::media::sample_track(rustrtc::media::MediaKind::Video, 10);
     let sender = Arc::new(rustrtc::peer_connection::RtpSender::new(
         track, 12345, // SSRC
     ));
-    *transceiver.sender.lock().await = Some(sender);
+    *transceiver.sender.lock().unwrap() = Some(sender);
 
     // 2. Create WebRTC PeerConnection (Answerer)
     let mut m = MediaEngine::default();
@@ -402,7 +394,7 @@ async fn interop_vp8_echo_with_pli() -> Result<()> {
     }
 
     let offer = rust_pc.create_offer().await?;
-    rust_pc.set_local_description(offer.clone()).await?;
+    rust_pc.set_local_description(offer.clone())?;
 
     // Convert RustRTC SDP to WebRTC SDP
     let offer_sdp = offer.to_sdp_string();
@@ -426,6 +418,9 @@ async fn interop_vp8_echo_with_pli() -> Result<()> {
     // 6. RustRTC sets Remote Description
     rust_pc.set_remote_description(rust_answer).await?;
 
+    // Wait for connection
+    rust_pc.wait_for_connection().await?;
+
     // 7. Start sending data from RustRTC
     let source_clone = source.clone();
     tokio::spawn(async move {
@@ -447,7 +442,7 @@ async fn interop_vp8_echo_with_pli() -> Result<()> {
     });
 
     // 8. Verify Echo on RustRTC
-    let receiver = transceiver.receiver.lock().await.clone().unwrap();
+    let receiver = transceiver.receiver.lock().unwrap().clone().unwrap();
     let track = receiver.track();
 
     let mut received_count = 0;
@@ -473,7 +468,7 @@ async fn interop_vp8_echo_with_pli() -> Result<()> {
     timeout(timeout_duration, receive_task).await??;
 
     // Cleanup
-    rust_pc.close().await;
+    rust_pc.close();
     webrtc_pc.close().await?;
 
     Ok(())

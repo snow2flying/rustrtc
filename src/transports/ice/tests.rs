@@ -1,14 +1,16 @@
 use super::*;
 use crate::{IceServer, RtcConfiguration};
-use anyhow::Result;
-use turn::{
-    Error as TurnError,
+use ::turn::{
     auth::{AuthHandler, generate_auth_key},
     relay::relay_static::RelayAddressGeneratorStatic,
-    server::{Server, config::ConnConfig, config::ServerConfig},
+    server::{
+        Server,
+        config::{ConnConfig, ServerConfig},
+    },
 };
+use anyhow::Result;
 // use webrtc_util::vnet::net::Net;
-type TurnResult<T> = std::result::Result<T, TurnError>;
+type TurnResult<T> = std::result::Result<T, ::turn::Error>;
 
 #[test]
 fn parse_turn_uri() {
@@ -84,7 +86,7 @@ async fn turn_client_can_create_permission() -> Result<()> {
 
 const TEST_USERNAME: &str = "test";
 const TEST_PASSWORD: &str = "test";
-const TEST_REALM: &str = "rport.turn";
+const TEST_REALM: &str = ".turn";
 
 struct TestTurnServer {
     server: Option<Server>,
@@ -157,7 +159,7 @@ impl AuthHandler for StaticAuthHandler {
         _src_addr: SocketAddr,
     ) -> TurnResult<Vec<u8>> {
         if username != self.username {
-            return Err(TurnError::ErrNoSuchUser);
+            return Err(::turn::Error::ErrNoSuchUser);
         }
         Ok(generate_auth_key(username, realm, &self.password))
     }

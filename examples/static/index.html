@@ -22,10 +22,12 @@
 <body>
     <h1>RustRTC Echo Demo</h1>
     <div>
-        <label for="backendSelect">Backend:</label>
-        <select id="backendSelect">
-            <option value="rustrtc">RustRTC</option>
-            <option value="webrtc-rs">WebRTC.rs</option>
+        <label for="modeSelect">Mode:</label>
+        <select id="modeSelect">
+            <option value="echo">Data Channel + Local Cam Echo</option>
+            <option value="datachannel">Data Channel Only</option>
+            <option value="video">Data Channel + Remote Video</option>
+            <option value="video-only">Remote Video Only</option>
         </select>
         <button onclick="start()" id="startBtn">Start Connection</button>
     </div>
@@ -96,30 +98,42 @@
                 }
             };
 
+            const mode = document.getElementById('modeSelect').value;
+
             // Get local media
-            try {
-                const stream = await navigator.mediaDevices.getUserMedia({ video: true, audio: false });
-                document.getElementById('localVideo').srcObject = stream;
-                stream.getTracks().forEach(track => pc.addTrack(track, stream));
-                log("Added local video track");
-            } catch (e) {
-                log("Could not get local video: " + e);
+            if (mode === 'echo' || mode === 'video') {
+                try {
+                    const stream = await navigator.mediaDevices.getUserMedia({ video: true, audio: false });
+                    document.getElementById('localVideo').srcObject = stream;
+                    stream.getTracks().forEach(track => pc.addTrack(track, stream));
+                    log("Added local video track");
+                } catch (e) {
+                    log("Could not get local video: " + e);
+                    // Fallback: add transceiver so we can still receive video
+                    pc.addTransceiver('video', { direction: 'recvonly' });
+                    log("Added video transceiver (recvonly) as fallback");
+                }
+            } else if (mode === 'video-only') {
+                pc.addTransceiver('video', { direction: 'recvonly' });
+                log("Added video transceiver (recvonly)");
             }
 
             // Create negotiated data channel
-            const dc = pc.createDataChannel("echo", { negotiated: true, id: 0 });
-            dataChannel = dc;
+            if (mode !== 'video-only') {
+                const dc = pc.createDataChannel("echo", { negotiated: true, id: 0 });
+                dataChannel = dc;
 
-            dc.onopen = () => {
-                log("DataChannel open");
-                document.getElementById('msgInput').disabled = false;
-                document.getElementById('sendBtn').disabled = false;
-                document.getElementById('msgInput').focus();
-            };
+                dc.onopen = () => {
+                    log("DataChannel open");
+                    document.getElementById('msgInput').disabled = false;
+                    document.getElementById('sendBtn').disabled = false;
+                    document.getElementById('msgInput').focus();
+                };
 
-            dc.onmessage = (e) => {
-                log("Received: " + e.data);
-            };
+                dc.onmessage = (e) => {
+                    log("Received: " + e.data);
+                };
+            }
 
             pc.onicecandidate = (e) => {
                 if (e.candidate) {
@@ -151,8 +165,7 @@
             const offerSdp = pc.localDescription.sdp;
             log("Sending Offer SDP: " + offerSdp);
 
-            const backend = document.getElementById('backendSelect').value;
-            log("Using backend: " + backend);
+            log("Using mode: " + mode);
 
             const response = await fetch('/offer', {
                 method: 'POST',
@@ -160,7 +173,7 @@
                 body: JSON.stringify({
                     sdp: offerSdp,
                     type: pc.localDescription.type,
-                    backend: backend
+                    mode: mode
                 })
             });
 

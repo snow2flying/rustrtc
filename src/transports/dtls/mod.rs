@@ -67,15 +67,19 @@ pub struct SessionKeys {
     pub server_random: Vec<u8>,
 }
 
-pub struct DtlsTransport {
+struct DtlsInner {
     conn: Arc<IceConn>,
     state: Arc<Mutex<DtlsState>>,
     state_tx: tokio::sync::watch::Sender<DtlsState>,
     state_rx: tokio::sync::watch::Receiver<DtlsState>,
     incoming_data_rx: Arc<Mutex<mpsc::Receiver<Vec<u8>>>>,
     outgoing_data_tx: mpsc::Sender<Vec<u8>>,
-    // Internal channel to feed the handshake loop from PacketReceiver
     handshake_rx_feeder: mpsc::Sender<Vec<u8>>,
+}
+
+pub struct DtlsTransport {
+    inner: Arc<DtlsInner>,
+    close_tx: Arc<tokio::sync::Notify>,
 }
 
 #[derive(Clone)]
@@ -98,6 +102,10 @@ impl fmt::Display for DtlsState {
 }
 
 impl DtlsTransport {
+    pub async fn get_state(&self) -> DtlsState {
+        self.inner.state.lock().await.clone()
+    }
+
     pub async fn new(
         conn: Arc<IceConn>,
         certificate: Certificate,
@@ -108,7 +116,7 @@ impl DtlsTransport {
         let (handshake_rx_feeder, handshake_rx) = mpsc::channel(100);
         let (state_tx, state_rx) = tokio::sync::watch::channel(DtlsState::New);
 
-        let transport = Arc::new(Self {
+        let inner = Arc::new(DtlsInner {
             conn: conn.clone(),
             state: Arc::new(Mutex::new(DtlsState::New)),
             state_tx,
@@ -118,24 +126,33 @@ impl DtlsTransport {
             handshake_rx_feeder,
         });
 
+        let close_tx = Arc::new(tokio::sync::Notify::new());
+        let close_rx = close_tx.clone();
+
+        let transport = Arc::new(Self {
+            inner: inner.clone(),
+            close_tx,
+        });
+
         // Register with IceConn
         conn.set_dtls_receiver(transport.clone()).await;
 
-        let transport_clone = transport.clone();
+        let inner_clone = inner.clone();
         tokio::spawn(async move {
-            if let Err(e) = transport_clone
+            if let Err(e) = inner_clone
                 .handshake(
                     certificate,
                     is_client,
                     incoming_data_tx,
                     outgoing_data_rx,
                     handshake_rx,
+                    close_rx,
                 )
                 .await
             {
                 warn!("DTLS handshake failed: {}", e);
-                *transport_clone.state.lock().await = DtlsState::Failed;
-                let _ = transport_clone.state_tx.send(DtlsState::Failed);
+                *inner_clone.state.lock().await = DtlsState::Failed;
+                let _ = inner_clone.state_tx.send(DtlsState::Failed);
             }
             // Connected state is set inside handshake now
         });
@@ -144,23 +161,24 @@ impl DtlsTransport {
     }
 
     pub fn subscribe_state(&self) -> tokio::sync::watch::Receiver<DtlsState> {
-        self.state_rx.clone()
+        self.inner.state_rx.clone()
     }
 
     pub async fn send(&self, data: &[u8]) -> Result<()> {
-        self.outgoing_data_tx
+        self.inner
+            .outgoing_data_tx
             .send(data.to_vec())
             .await
             .map_err(|_| anyhow::anyhow!("Send failed"))
     }
 
     pub async fn recv(&self) -> Result<Vec<u8>> {
-        let mut rx = self.incoming_data_rx.lock().await;
+        let mut rx = self.inner.incoming_data_rx.lock().await;
         rx.recv().await.ok_or(anyhow::anyhow!("Channel closed"))
     }
 
     pub async fn export_keying_material(&self, label: &str, len: usize) -> Result<Vec<u8>> {
-        let state = self.state.lock().await;
+        let state = self.inner.state.lock().await;
         if let DtlsState::Connected(keys, _) = &*state {
             let seed = [keys.client_random.as_slice(), keys.server_random.as_slice()].concat();
             prf_sha256(&keys.master_secret, label.as_bytes(), &seed, len)
@@ -168,15 +186,18 @@ impl DtlsTransport {
             Err(anyhow::anyhow!("DTLS not connected"))
         }
     }
+}
 
+impl Drop for DtlsTransport {
+    fn drop(&mut self) {
+        self.close_tx.notify_waiters();
+    }
+}
+
+impl DtlsInner {
     async fn handle_retransmit(&self, ctx: &HandshakeContext, is_client: bool) {
-        if let Some(buf) = &ctx.last_flight_buffer {
-            if is_client && ctx.message_seq == 1 {
-                trace!("Retransmitting ClientHello");
-                if let Err(e) = self.conn.send(buf).await {
-                    warn!("Retransmission failed: {}", e);
-                }
-            }
+        if let Some(buf) = &ctx.last_flight_buffer && is_client && ctx.message_seq == 1 && let Err(e) = self.conn.send(buf).await {
+            warn!("Retransmission failed: {}", e);
         }
     }
 
@@ -315,16 +336,11 @@ impl DtlsTransport {
                     let consumed = msg_buf.len() - body.len();
                     let raw_msg = msg_buf.slice(0..consumed);
 
-                    trace!(
-                        "Received handshake message: {:?} seq={} frag_off={} frag_len={}",
-                        msg.msg_type, msg.message_seq, msg.fragment_offset, msg.fragment_length
-                    );
-
                     if msg.msg_type != HandshakeType::Finished
                         && msg.msg_type != HandshakeType::HelloRequest
                         && msg.msg_type != HandshakeType::HelloVerifyRequest
                     {
-                        ctx.handshake_messages.extend_from_slice(&raw_msg);
+                        ctx.handshake_messages.extend_from_slice(&raw_msg[..]);
                     }
 
                     self.handle_handshake_message(msg, &raw_msg, ctx, certificate, is_client)
@@ -366,9 +382,7 @@ impl DtlsTransport {
             HandshakeType::ServerHello => {
                 self.handle_server_hello(msg, ctx, is_client).await?;
             }
-            HandshakeType::Certificate => {
-                trace!("Received Certificate");
-            }
+            HandshakeType::Certificate => {}
             HandshakeType::ServerKeyExchange => {
                 self.handle_server_key_exchange(msg, ctx, is_client).await?;
             }
@@ -751,7 +765,7 @@ impl DtlsTransport {
             }
 
             // Add Client's Finished to transcript
-            ctx.handshake_messages.extend_from_slice(&raw_msg);
+            ctx.handshake_messages.extend_from_slice(raw_msg);
 
             // Send ChangeCipherSpec
             let record = DtlsRecord {
@@ -977,7 +991,6 @@ impl DtlsTransport {
         is_client: bool,
     ) -> Result<()> {
         if is_client {
-            trace!("Received ServerKeyExchange");
             let mut body = msg.body.clone();
             if let Ok(server_key_exchange) = ServerKeyExchange::decode(&mut body) {
                 ctx.peer_public_key = Some(server_key_exchange.public_key);
@@ -991,8 +1004,6 @@ impl DtlsTransport {
         ctx: &mut HandshakeContext,
         is_client: bool,
     ) -> Result<()> {
-        trace!("Received ServerHelloDone");
-
         // Send ClientKeyExchange
         let client_key_exchange = ClientKeyExchange {
             identity_hint: vec![],
@@ -1047,7 +1058,6 @@ impl DtlsTransport {
         };
 
         let shared_secret = secret.diffie_hellman(&pk);
-        trace!("Shared secret computed (Client)");
 
         let (cr, sr) = match (&ctx.client_random, &ctx.server_random) {
             (Some(cr), Some(sr)) => (cr, sr),
@@ -1078,14 +1088,10 @@ impl DtlsTransport {
             Err(_) => return Ok(()),
         };
 
-        trace!("Master secret derived: {:?}", master_secret);
-
         let keys = match expand_keys(&master_secret, cr, sr) {
             Ok(k) => k,
             Err(_) => return Ok(()),
         };
-
-        trace!("Session keys derived (Client)");
         ctx.session_keys = Some(keys);
 
         // Send ChangeCipherSpec
@@ -1144,6 +1150,7 @@ impl DtlsTransport {
         incoming_data_tx: mpsc::Sender<Vec<u8>>,
         mut outgoing_data_rx: mpsc::Receiver<Vec<u8>>,
         mut handshake_rx: mpsc::Receiver<Vec<u8>>,
+        close_rx: Arc<tokio::sync::Notify>,
     ) -> Result<()> {
         *self.state.lock().await = DtlsState::Handshaking;
         let _ = self.state_tx.send(DtlsState::Handshaking);
@@ -1156,14 +1163,13 @@ impl DtlsTransport {
 
         if is_client {
             // Send ClientHello
-            debug!("Sending ClientHello");
             let random = Random::new();
             ctx.client_random = Some(random.to_bytes());
 
             let mut extensions = Vec::new();
 
             // Extended Master Secret
-            extensions.extend_from_slice(&[0x00, 0x17]); // Type 23
+            extensions.extend_from_slice(&[0x00, 17]); // Type 23
             extensions.extend_from_slice(&[0x00, 0x00]); // Length 0
 
             // Supported Elliptic Curves (secp256r1)
@@ -1218,6 +1224,9 @@ impl DtlsTransport {
 
         loop {
             tokio::select! {
+                _ = close_rx.notified() => {
+                    return Ok(());
+                }
                 _ = retransmit_interval.tick() => {
                     self.handle_retransmit(&ctx, is_client).await;
                 }
@@ -1281,25 +1290,23 @@ impl DtlsTransport {
         let payload = buf.freeze();
         let mut record_payload = payload;
 
-        if epoch > 0 {
-            if let Some(keys) = session_keys {
-                let (key, iv) = if is_client {
-                    (&keys.client_write_key, &keys.client_write_iv)
-                } else {
-                    (&keys.server_write_key, &keys.server_write_iv)
-                };
+        if epoch > 0 && let Some(keys) = session_keys {
+            let (key, iv) = if is_client {
+                (&keys.client_write_key, &keys.client_write_iv)
+            } else {
+                (&keys.server_write_key, &keys.server_write_iv)
+            };
 
-                let full_seq = ((epoch as u64) << 48) | *sequence_number;
+            let full_seq = ((epoch as u64) << 48) | *sequence_number;
 
-                record_payload = Bytes::from(encrypt_record(
-                    ContentType::Handshake,
-                    ProtocolVersion::DTLS_1_2,
-                    full_seq,
-                    &record_payload,
-                    key,
-                    iv,
-                )?);
-            }
+            record_payload = Bytes::from(encrypt_record(
+                ContentType::Handshake,
+                ProtocolVersion::DTLS_1_2,
+                full_seq,
+                &record_payload,
+                key,
+                iv,
+            )?);
         }
 
         let record = DtlsRecord {
@@ -1325,13 +1332,8 @@ impl DtlsTransport {
 impl Clone for DtlsTransport {
     fn clone(&self) -> Self {
         Self {
-            conn: self.conn.clone(),
-            state: self.state.clone(),
-            state_tx: self.state_tx.clone(),
-            state_rx: self.state_rx.clone(),
-            incoming_data_rx: self.incoming_data_rx.clone(),
-            outgoing_data_tx: self.outgoing_data_tx.clone(),
-            handshake_rx_feeder: self.handshake_rx_feeder.clone(),
+            inner: self.inner.clone(),
+            close_tx: self.close_tx.clone(),
         }
     }
 }
@@ -1344,7 +1346,7 @@ impl PacketReceiver for DtlsTransport {
     async fn receive(&self, packet: Bytes, _addr: SocketAddr) {
         // Push to the internal handshake loop
         // We ignore errors here (e.g. if the loop is closed)
-        let _ = self.handshake_rx_feeder.send(packet.to_vec()).await;
+        let _ = self.inner.handshake_rx_feeder.send(packet.to_vec()).await;
     }
 }
 
@@ -1413,12 +1415,6 @@ fn calculate_verify_data(
     let mut hasher = Sha256::new();
     hasher.update(handshake_messages);
     let hash = hasher.finalize();
-    trace!(
-        "VerifyData: label={:?} hash={:?}",
-        String::from_utf8_lossy(label),
-        hash
-    );
-
     let verify_data = prf_sha256(master_secret, label, &hash, 12)?;
     Ok(verify_data)
 }
@@ -1467,20 +1463,6 @@ fn decrypt_record(
 
     let plaintext_len = ciphertext.len() - 16;
     let aad = make_aad(seq, content_type, version, plaintext_len);
-
-    trace!(
-        "Decrypting: seq={} epoch={} seq_num={} type={:?} ver={:?} len={}",
-        seq,
-        seq >> 48,
-        seq & 0xFFFFFFFFFFFF,
-        content_type,
-        version,
-        plaintext_len
-    );
-    trace!("Nonce: {:?}", nonce_bytes);
-    trace!("AAD: {:?}", aad);
-    trace!("Key: {:?}", key);
-    trace!("IV: {:?}", iv);
 
     let decrypted_payload = cipher
         .decrypt(

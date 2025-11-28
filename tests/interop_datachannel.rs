@@ -1,7 +1,6 @@
 use anyhow::Result;
 use rustrtc::PeerConnection;
 use rustrtc::RtcConfiguration;
-use rustrtc::peer_connection::IceConnectionState;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::time::timeout;
@@ -21,7 +20,7 @@ async fn interop_datachannel_test() -> Result<()> {
     let rust_pc = PeerConnection::new(rust_config);
 
     // Create DataChannel
-    let rust_dc = rust_pc.create_data_channel("test-channel").await?;
+    let rust_dc = rust_pc.create_data_channel("test-channel")?;
 
     // 2. Create WebRTC PeerConnection (Answerer)
     let mut m = MediaEngine::default();
@@ -69,7 +68,7 @@ async fn interop_datachannel_test() -> Result<()> {
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
     let offer = rust_pc.create_offer().await?; // Re-create with candidates
-    rust_pc.set_local_description(offer.clone()).await?;
+    rust_pc.set_local_description(offer.clone())?;
 
     let webrtc_desc = RTCSessionDescription::offer(offer.to_sdp_string())?;
     webrtc_pc.set_remote_description(webrtc_desc).await?;
@@ -85,28 +84,8 @@ async fn interop_datachannel_test() -> Result<()> {
     rust_pc.set_remote_description(rust_answer).await?;
 
     println!("Waiting for ICE Connected...");
-    let mut ice_state_rx = rust_pc.subscribe_ice_connection_state().await;
-    loop {
-        let state = *ice_state_rx.borrow_and_update();
-        println!("ICE State: {:?}", state);
-        if state == IceConnectionState::Connected {
-            break;
-        }
-        if state == IceConnectionState::Failed {
-            anyhow::bail!("ICE Failed");
-        }
-        // Wait for change or timeout
-        if tokio::time::timeout(Duration::from_secs(1), ice_state_rx.changed()).await.is_err() {
-             // Don't break, just check again, maybe it's already connected but we missed the event?
-             // Actually borrow_and_update should handle it.
-             // If timeout, maybe we are stuck.
-             println!("Timeout waiting for ICE state change, current: {:?}", *ice_state_rx.borrow());
-             if *ice_state_rx.borrow() == IceConnectionState::Connected {
-                 break;
-             }
-             // break; // Don't break, let the outer timeout handle it if needed, or just continue loop
-        }
-    }
+    rust_pc.wait_for_connection().await?;
+    println!("ICE Connected (PeerConnection Connected)");
 
     // 4. Wait for DataChannel to open
     println!("Waiting for DataChannel...");
@@ -179,7 +158,7 @@ async fn interop_datachannel_test() -> Result<()> {
     assert!(received_msg, "RustRTC did not receive message");
 
     // Cleanup
-    rust_pc.close().await;
+    rust_pc.close();
     webrtc_pc.close().await?;
 
     Ok(())

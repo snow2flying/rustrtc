@@ -15,7 +15,7 @@ async fn main() {
     let (source, track) = sample_track(MediaKind::Audio, 10);
 
     // 3. Add track to PeerConnection
-    let _sender = pc.add_track(track).await.expect("failed to add track");
+    let _sender = pc.add_track(track).expect("failed to add track");
 
     println!("Track added, sender created.");
 

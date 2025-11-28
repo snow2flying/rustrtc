@@ -1,20 +1,9 @@
 use crate::transports::dtls::DtlsTransport;
 use anyhow::Result;
 use bytes::{Buf, BufMut, Bytes, BytesMut};
-use std::sync::Arc;
-use tokio::sync::{Mutex, mpsc};
+use std::sync::{Arc, Mutex, Weak};
+use tokio::sync::{Mutex as TokioMutex, mpsc};
 use tracing::{trace, warn};
-
-pub struct SctpTransport {
-    dtls_transport: Arc<DtlsTransport>,
-    state: Arc<Mutex<SctpState>>,
-    data_channels: Arc<Mutex<Vec<Arc<DataChannel>>>>,
-    local_port: u16,
-    remote_port: u16,
-    verification_tag: Mutex<u32>,
-    remote_verification_tag: Mutex<u32>,
-    next_tsn: Mutex<u32>,
-}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SctpState {
@@ -37,7 +26,7 @@ pub struct DataChannel {
     pub state: Mutex<DataChannelState>,
     pub next_ssn: Mutex<u16>,
     tx: mpsc::UnboundedSender<DataChannelEvent>,
-    rx: Mutex<mpsc::UnboundedReceiver<DataChannelEvent>>,
+    rx: TokioMutex<mpsc::UnboundedReceiver<DataChannelEvent>>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -70,12 +59,28 @@ const CT_ERROR: u8 = 9;
 const CT_COOKIE_ECHO: u8 = 10;
 const CT_COOKIE_ACK: u8 = 11;
 
+struct SctpInner {
+    dtls_transport: Arc<DtlsTransport>,
+    state: Arc<Mutex<SctpState>>,
+    data_channels: Arc<Mutex<Vec<Weak<DataChannel>>>>,
+    local_port: u16,
+    remote_port: u16,
+    verification_tag: Mutex<u32>,
+    remote_verification_tag: Mutex<u32>,
+    next_tsn: Mutex<u32>,
+}
+
+pub struct SctpTransport {
+    inner: Arc<SctpInner>,
+    close_tx: Arc<tokio::sync::Notify>,
+}
+
 impl SctpTransport {
     pub fn new(
         dtls_transport: Arc<DtlsTransport>,
-        data_channels: Arc<Mutex<Vec<Arc<DataChannel>>>>,
+        data_channels: Arc<Mutex<Vec<Weak<DataChannel>>>>,
     ) -> Arc<Self> {
-        let transport = Arc::new(Self {
+        let inner = Arc::new(SctpInner {
             dtls_transport,
             state: Arc::new(Mutex::new(SctpState::New)),
             data_channels,
@@ -86,9 +91,17 @@ impl SctpTransport {
             next_tsn: Mutex::new(0),
         });
 
-        let t_clone = transport.clone();
+        let close_tx = Arc::new(tokio::sync::Notify::new());
+        let close_rx = close_tx.clone();
+
+        let transport = Arc::new(Self {
+            inner: inner.clone(),
+            close_tx,
+        });
+
+        let inner_clone = inner.clone();
         tokio::spawn(async move {
-            t_clone.run_loop().await;
+            inner_clone.run_loop(close_rx).await;
         });
 
         transport
@@ -96,27 +109,48 @@ impl SctpTransport {
 
     pub async fn create_data_channel(&self, label: &str, id: u16) -> Arc<DataChannel> {
         let dc = Arc::new(DataChannel::new(id, label.to_string()));
-        self.data_channels.lock().await.push(dc.clone());
+        self.inner
+            .data_channels
+            .lock()
+            .unwrap()
+            .push(Arc::downgrade(&dc));
         dc
     }
 
-    async fn run_loop(&self) {
-        *self.state.lock().await = SctpState::Connecting;
+    pub async fn send_data(&self, channel_id: u16, data: &[u8]) -> Result<()> {
+        self.inner.send_data(channel_id, data).await
+    }
+}
+
+impl Drop for SctpTransport {
+    fn drop(&mut self) {
+        self.close_tx.notify_waiters();
+    }
+}
+
+impl SctpInner {
+    async fn run_loop(&self, close_rx: Arc<tokio::sync::Notify>) {
+        *self.state.lock().unwrap() = SctpState::Connecting;
         loop {
-            match self.dtls_transport.recv().await {
-                Ok(packet) => {
-                    if let Err(e) = self.handle_packet(&packet).await {
-                        warn!("SCTP handle packet error: {}", e);
+            tokio::select! {
+                _ = close_rx.notified() => break,
+                res = self.dtls_transport.recv() => {
+                    match res {
+                        Ok(packet) => {
+                            if let Err(e) = self.handle_packet(&packet).await {
+                                warn!("SCTP handle packet error: {}", e);
+                            }
+                        }
+                        Err(e) => {
+                            warn!("SCTP loop error: {}", e);
+                            break;
+                        }
                     }
-                }
-                Err(e) => {
-                    warn!("SCTP loop error: {}", e);
-                    break;
                 }
             }
         }
 
-        *self.state.lock().await = SctpState::Closed;
+        *self.state.lock().unwrap() = SctpState::Closed;
     }
 
     async fn handle_packet(&self, packet: &[u8]) -> Result<()> {
@@ -179,11 +213,11 @@ impl SctpTransport {
         let _inbound_streams = buf.get_u16();
         let _initial_tsn = buf.get_u32();
 
-        *self.remote_verification_tag.lock().await = initiate_tag;
+        *self.remote_verification_tag.lock().unwrap() = initiate_tag;
 
         // Generate local tag
         let local_tag = 12345; // Fixed for now
-        *self.verification_tag.lock().await = local_tag;
+        *self.verification_tag.lock().unwrap() = local_tag;
 
         // Send INIT ACK
         // We need to construct a cookie. For simplicity, we'll just echo back some dummy data.
@@ -218,21 +252,21 @@ impl SctpTransport {
 
     async fn handle_cookie_echo(&self, _chunk: Bytes) -> Result<()> {
         // Send COOKIE ACK
-        self.send_chunk(
-            CT_COOKIE_ACK,
-            0,
-            Bytes::new(),
-            *self.remote_verification_tag.lock().await,
-        )
-        .await?;
+        let tag = *self.remote_verification_tag.lock().unwrap();
+        self.send_chunk(CT_COOKIE_ACK, 0, Bytes::new(), tag).await?;
 
-        *self.state.lock().await = SctpState::Connected;
+        *self.state.lock().unwrap() = SctpState::Connected;
         {
-            let channels = self.data_channels.lock().await;
-            for dc in channels.iter() {
-                *dc.state.lock().await = DataChannelState::Open;
-                dc.send_event(DataChannelEvent::Open);
-            }
+            let mut channels = self.data_channels.lock().unwrap();
+            channels.retain(|weak_dc| {
+                if let Some(dc) = weak_dc.upgrade() {
+                    *dc.state.lock().unwrap() = DataChannelState::Open;
+                    dc.send_event(DataChannelEvent::Open);
+                    true
+                } else {
+                    false
+                }
+            });
         }
 
         Ok(())
@@ -242,13 +276,8 @@ impl SctpTransport {
         // Send HEARTBEAT ACK with same info
         // ...
 
-        self.send_chunk(
-            CT_HEARTBEAT_ACK,
-            0,
-            chunk,
-            *self.remote_verification_tag.lock().await,
-        )
-        .await?;
+        let tag = *self.remote_verification_tag.lock().unwrap();
+        self.send_chunk(CT_HEARTBEAT_ACK, 0, chunk, tag).await?;
         Ok(())
     }
 
@@ -259,17 +288,10 @@ impl SctpTransport {
         }
         let tsn = buf.get_u32();
         let stream_id = buf.get_u16();
-        let stream_seq = buf.get_u16();
-        let payload_proto = buf.get_u32();
+        let _stream_seq = buf.get_u16();
+        let _payload_proto = buf.get_u32();
 
         let user_data = buf;
-        trace!(
-            "DATA chunk: stream={} seq={} proto={} len={}",
-            stream_id,
-            stream_seq,
-            payload_proto,
-            user_data.len()
-        );
 
         // Send SACK (Simplified: just ack this TSN)
         let mut sack = BytesMut::new();
@@ -278,16 +300,23 @@ impl SctpTransport {
         sack.put_u16(0); // Number of Gap Ack Blocks
         sack.put_u16(0); // Number of Duplicate TSNs
 
-        self.send_chunk(
-            CT_SACK,
-            0,
-            sack.freeze(),
-            *self.remote_verification_tag.lock().await,
-        )
-        .await?;
+        let tag = *self.remote_verification_tag.lock().unwrap();
+        self.send_chunk(CT_SACK, 0, sack.freeze(), tag).await?;
 
-        let channels = self.data_channels.lock().await;
-        if let Some(dc) = channels.iter().find(|c| c.id == stream_id) {
+        let mut channels = self.data_channels.lock().unwrap();
+        let mut found_dc = None;
+        channels.retain(|weak_dc| {
+            if let Some(dc) = weak_dc.upgrade() {
+                if dc.id == stream_id {
+                    found_dc = Some(dc);
+                }
+                true
+            } else {
+                false
+            }
+        });
+
+        if let Some(dc) = found_dc {
             dc.send_event(DataChannelEvent::Message(user_data.to_vec()));
         }
 
@@ -340,16 +369,28 @@ impl SctpTransport {
         let mut payload = BytesMut::new();
 
         let tsn = {
-            let mut tsn_guard = self.next_tsn.lock().await;
+            let mut tsn_guard = self.next_tsn.lock().unwrap();
             let tsn = *tsn_guard;
             *tsn_guard = tsn.wrapping_add(1);
             tsn
         };
 
         let ssn = {
-            let channels = self.data_channels.lock().await;
-            if let Some(dc) = channels.iter().find(|c| c.id == channel_id) {
-                let mut ssn_guard = dc.next_ssn.lock().await;
+            let mut channels = self.data_channels.lock().unwrap();
+            let mut found_dc = None;
+            channels.retain(|weak_dc| {
+                if let Some(dc) = weak_dc.upgrade() {
+                    if dc.id == channel_id {
+                        found_dc = Some(dc);
+                    }
+                    true
+                } else {
+                    false
+                }
+            });
+
+            if let Some(dc) = found_dc {
+                let mut ssn_guard = dc.next_ssn.lock().unwrap();
                 let ssn = *ssn_guard;
                 *ssn_guard = ssn.wrapping_add(1);
                 ssn
@@ -364,7 +405,7 @@ impl SctpTransport {
         payload.put_u32(51); // PPID: WebRTC String (51) or Binary (53)
         payload.put_slice(data);
 
-        let tag = *self.remote_verification_tag.lock().await;
+        let tag = *self.remote_verification_tag.lock().unwrap();
         self.send_chunk(CT_DATA, 0x03, payload.freeze(), tag).await // 0x03 = B(egin) | E(nd)
     }
 }
@@ -378,7 +419,7 @@ impl DataChannel {
             state: Mutex::new(DataChannelState::Connecting),
             next_ssn: Mutex::new(0),
             tx,
-            rx: Mutex::new(rx),
+            rx: TokioMutex::new(rx),
         }
     }
 

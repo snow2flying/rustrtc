@@ -28,4 +28,3 @@ pub use transports::ice::{
     IceCandidate, IceCandidatePair, IceCandidateType, IceGathererState, IceRole, IceTransport,
     IceTransportState,
 };
-pub use transports::rtp::UdpRtpEndpoint;

@@ -146,8 +146,8 @@ impl MediaSample {
             ),
         };
 
-        let timestamp = rtp_timestamp
-            .unwrap_or_else(|| (timestamp_duration.as_secs_f64() * clock_rate as f64) as u32);
+        let timestamp =
+            rtp_timestamp.unwrap_or((timestamp_duration.as_secs_f64() * clock_rate as f64) as u32);
 
         let seq = frame_seq.unwrap_or(*sequence_number);
         if frame_seq.is_none() {

@@ -26,9 +26,7 @@ async fn test_padding_packet_drop() -> Result<()> {
         rustrtc::media::sample_track(rustrtc::media::MediaKind::Video, 96);
 
     // PC1 adds transceiver with sender
-    let t1 = pc1
-        .add_transceiver(MediaKind::Video, TransceiverDirection::SendRecv)
-        .await;
+    let t1 = pc1.add_transceiver(MediaKind::Video, TransceiverDirection::SendRecv);
 
     let s1 = Arc::new(rustrtc::peer_connection::RtpSender::new(
         client_track,
@@ -38,23 +36,22 @@ async fn test_padding_packet_drop() -> Result<()> {
         payload_type: 96,
         clock_rate: 90000,
         channels: 0,
-    })
-    .await;
-    *t1.sender.lock().await = Some(s1.clone());
+    });
+    *t1.sender.lock().unwrap() = Some(s1.clone());
 
     // 3. Negotiate
     // PC1 Create Offer
     let _ = pc1.create_offer().await?; // Trigger gathering
     wait_for_gathering(&pc1).await;
     let offer = pc1.create_offer().await?;
-    pc1.set_local_description(offer.clone()).await?;
+    pc1.set_local_description(offer.clone())?;
 
     // PC2 Set Remote Offer
     pc2.set_remote_description(offer).await?;
 
     // Setup Echo on PC2 (Before Answer)
     // Get the transceiver created by set_remote_description
-    let t2 = pc2.get_transceivers().await.first().unwrap().clone();
+    let t2 = pc2.get_transceivers().first().unwrap().clone();
 
     // Create a sender for PC2 to echo back
     let (sample_source, outgoing_track) =
@@ -67,21 +64,20 @@ async fn test_padding_packet_drop() -> Result<()> {
         payload_type: 96,
         clock_rate: 90000,
         channels: 0,
-    })
-    .await;
-    *t2.sender.lock().await = Some(s2);
+    });
+    *t2.sender.lock().unwrap() = Some(s2);
 
     // PC2 Create Answer
     let _ = pc2.create_answer().await?; // Trigger gathering
     wait_for_gathering(&pc2).await;
     let answer = pc2.create_answer().await?;
-    pc2.set_local_description(answer.clone()).await?;
+    pc2.set_local_description(answer.clone())?;
 
     // PC1 Set Remote Answer
     pc1.set_remote_description(answer).await?;
 
     // 4. Start Echo Loop on PC2
-    let r2 = t2.receiver.lock().await.clone().unwrap();
+    let r2 = t2.receiver.lock().unwrap().clone().unwrap();
     let track2 = r2.track();
 
     tokio::spawn(async move {
@@ -97,7 +93,8 @@ async fn test_padding_packet_drop() -> Result<()> {
     });
 
     // 6. Send Packets from PC1
-    tokio::time::sleep(Duration::from_secs(1)).await;
+    pc1.wait_for_connection().await?;
+    pc2.wait_for_connection().await?;
 
     // Packet 1: Valid
     println!("Sending P1");
@@ -157,7 +154,7 @@ async fn test_padding_packet_drop() -> Result<()> {
     println!("Sent P3");
 
     // 7. Verify Reception on PC1
-    let r1 = t1.receiver.lock().await.clone().unwrap();
+    let r1 = t1.receiver.lock().unwrap().clone().unwrap();
     let track1 = r1.track();
 
     // Expect P1
@@ -186,8 +183,8 @@ async fn test_padding_packet_drop() -> Result<()> {
     let res = timeout(Duration::from_millis(500), track1.recv()).await;
     assert!(res.is_err(), "Should not receive a 3rd packet");
 
-    pc1.close().await;
-    pc2.close().await;
+    pc1.close();
+    pc2.close();
 
     Ok(())
 }

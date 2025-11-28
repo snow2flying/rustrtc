@@ -390,14 +390,6 @@ pub struct ServerKeyExchange {
 
 impl ServerKeyExchange {
     pub fn encode(&self, buf: &mut BytesMut) {
-        let start_len = buf.len();
-        trace!(
-            "Encoding ServerKeyExchange: curve_type={}, named_curve={}, pubkey_len={}, sig_len={}",
-            self.curve_type,
-            self.named_curve,
-            self.public_key.len(),
-            self.signature.len()
-        );
         buf.put_u8(self.curve_type);
         buf.put_u16(self.named_curve);
         buf.put_u8(self.public_key.len() as u8);
@@ -411,10 +403,6 @@ impl ServerKeyExchange {
 
         buf.put_u16(self.signature.len() as u16);
         buf.put_slice(&self.signature);
-
-        let end_len = buf.len();
-        let encoded = &buf[start_len..end_len];
-        trace!("Encoded ServerKeyExchange bytes: {:02X?}", encoded);
     }
 
     pub fn decode(buf: &mut Bytes) -> Result<Self> {
@@ -494,7 +482,6 @@ impl ClientKeyExchange {
         if buf.is_empty() {
             bail!("ClientKeyExchange too short");
         }
-        trace!("ClientKeyExchange raw body: {:?}", buf);
         let public_key_len = buf.get_u8() as usize;
         if buf.len() < public_key_len {
             bail!("ClientKeyExchange too short for public key");

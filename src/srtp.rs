@@ -341,7 +341,7 @@ impl SrtpContext {
         Ok(())
     }
 
-    fn cipher_rtcp(&self, packet: &mut Vec<u8>, index: u32) -> SrtpResult<()> {
+    fn cipher_rtcp(&self, packet: &mut [u8], index: u32) -> SrtpResult<()> {
         // IV = (salt << 16) XOR (SSRC << 64) XOR (SRTCP_INDEX << 16)
         // Actually:
         // IV = (k_s * 2^16) XOR (SSRC * 2^64) XOR (SRTCP_INDEX * 2^16)
@@ -512,7 +512,12 @@ impl SrtpContext {
         }
         let mut block = [0u8; 16];
         block[4..8].copy_from_slice(&self.ssrc.to_be_bytes());
-        block[8..16].copy_from_slice(&index.to_be_bytes());
+
+        // IV = (salt * 2^16) XOR (SSRC * 2^64) XOR (Index * 2^16)
+        // We need to shift index left by 16 bits.
+        let iv_part = index << 16;
+        block[8..16].copy_from_slice(&iv_part.to_be_bytes());
+
         for i in 0..16 {
             iv[i] ^= block[i];
         }

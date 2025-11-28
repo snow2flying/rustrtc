@@ -1,12 +1,3 @@
-use std::sync::{
-    Arc,
-    atomic::{AtomicBool, Ordering},
-};
-
-use async_trait::async_trait;
-use tokio::sync::{Mutex, broadcast, mpsc};
-use tracing::warn;
-
 use crate::{
     media::{
         error::{MediaError, MediaResult},
@@ -14,6 +5,13 @@ use crate::{
     },
     transports::ice::stun::random_u64,
 };
+use async_trait::async_trait;
+use std::sync::{
+    Arc,
+    atomic::{AtomicBool, Ordering},
+};
+use tokio::sync::{Mutex, broadcast, mpsc};
+use tracing::warn;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TrackState {

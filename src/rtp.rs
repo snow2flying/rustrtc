@@ -55,13 +55,11 @@ impl RtpHeader {
         if self.csrcs.len() > 15 {
             return Err(RtpError::InvalidHeader("too many CSRC entries"));
         }
-        if let Some(ext) = &self.extension {
-            if ext.data.len() % 4 != 0 {
+        if let Some(ext) = &self.extension && ext.data.len() % 4 != 0 {
                 return Err(RtpError::InvalidHeader(
                     "header extension payload must be 32-bit aligned",
                 ));
             }
-        }
         Ok(())
     }
 }
