@@ -571,7 +571,7 @@ impl PeerConnection {
 
                         match crate::srtp::SrtpSession::new(profile, tx_keying, rx_keying) {
                             Ok(session) => {
-                                rtp_transport_clone.start_srtp(session).await;
+                                rtp_transport_clone.start_srtp(session);
 
                                 let transceivers = self.inner.transceivers.lock().unwrap();
                                 for t in transceivers.iter() {
@@ -605,7 +605,7 @@ impl PeerConnection {
                     }
 
                     let (rtcp_tx, mut rtcp_rx) = mpsc::channel(100);
-                    rtp_transport_clone.register_rtcp_listener(rtcp_tx).await;
+                    rtp_transport_clone.register_rtcp_listener(rtcp_tx);
                     let inner_weak_rtcp = inner_weak.clone();
 
                     let rtcp_loop = Box::pin(async move {
@@ -1756,7 +1756,7 @@ mod tests {
     async fn peer_connection_exposes_ice_transport() {
         let pc = PeerConnection::new(RtcConfiguration::default());
         let ice = pc.ice_transport();
-        assert_eq!(ice.state().await, IceTransportState::New);
+        assert_eq!(ice.state(), IceTransportState::New);
         assert_eq!(ice.config().ice_servers.len(), 0);
     }
 

@@ -27,7 +27,7 @@ impl RtpTransport {
         }
     }
 
-    pub async fn start_srtp(&self, srtp_session: SrtpSession) {
+    pub fn start_srtp(&self, srtp_session: SrtpSession) {
         let mut session = self.srtp_session.lock().unwrap();
         *session = Some(Arc::new(Mutex::new(srtp_session)));
     }
@@ -37,7 +37,7 @@ impl RtpTransport {
         listeners.insert(ssrc, tx);
     }
 
-    pub async fn register_rtcp_listener(&self, tx: mpsc::Sender<Vec<RtcpPacket>>) {
+    pub fn register_rtcp_listener(&self, tx: mpsc::Sender<Vec<RtcpPacket>>) {
         let mut listener = self.rtcp_listener.lock().unwrap();
         *listener = Some(tx);
     }

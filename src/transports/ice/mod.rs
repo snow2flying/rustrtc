@@ -97,7 +97,7 @@ impl IceTransport {
         }
     }
 
-    pub async fn state(&self) -> IceTransportState {
+    pub fn state(&self) -> IceTransportState {
         *self.inner.state.borrow()
     }
 
@@ -341,7 +341,12 @@ impl IceTransport {
         inner: &Arc<IceTransportInner>,
         client: &Arc<Mutex<TurnClient>>,
     ) {
-        if let Ok(msg) = StunMessage::decode(packet) && msg.class == StunClass::Indication && msg.method == StunMethod::Data && let Some(data) = &msg.data && let Some(peer_addr) = msg.xor_peer_address {
+        if let Ok(msg) = StunMessage::decode(packet)
+            && msg.class == StunClass::Indication
+            && msg.method == StunMethod::Data
+            && let Some(data) = &msg.data
+            && let Some(peer_addr) = msg.xor_peer_address
+        {
             handle_packet(
                 data,
                 peer_addr,
@@ -1026,17 +1031,19 @@ impl IceGatherer {
         }
 
         // 2. LAN IP
-        if let Ok(ip) = get_local_ip().await && !ip.is_loopback() {
+        if let Ok(ip) = get_local_ip().await
+            && !ip.is_loopback()
+        {
             match UdpSocket::bind(SocketAddr::new(ip, 0)).await {
-                    Ok(socket) => {
-                        if let Ok(addr) = socket.local_addr() {
-                            self.sockets.lock().await.push(Arc::new(socket));
-                            self.push_candidate(IceCandidate::host(addr, 1), seen).await;
-                        }
+                Ok(socket) => {
+                    if let Ok(addr) = socket.local_addr() {
+                        self.sockets.lock().await.push(Arc::new(socket));
+                        self.push_candidate(IceCandidate::host(addr, 1), seen).await;
                     }
-                    Err(e) => warn!("Failed to bind LAN socket on {}: {}", ip, e),
                 }
+                Err(e) => warn!("Failed to bind LAN socket on {}: {}", ip, e),
             }
+        }
 
         Ok(())
     }
@@ -1150,7 +1157,9 @@ impl IceServerUri {
         let mut transport = default_transport_for_scheme(scheme)?;
         if !query.is_empty() {
             for pair in query.split('&') {
-                if let Some((k, v)) = pair.split_once('=') && k == "transport" {
+                if let Some((k, v)) = pair.split_once('=')
+                    && k == "transport"
+                {
                     transport = match v.to_ascii_lowercase().as_str() {
                         "udp" => IceTransportProtocol::Udp,
                         "tcp" => IceTransportProtocol::Tcp,

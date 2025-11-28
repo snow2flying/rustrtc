@@ -107,7 +107,7 @@ impl SctpTransport {
         transport
     }
 
-    pub async fn create_data_channel(&self, label: &str, id: u16) -> Arc<DataChannel> {
+    pub fn create_data_channel(&self, label: &str, id: u16) -> Arc<DataChannel> {
         let dc = Arc::new(DataChannel::new(id, label.to_string()));
         self.inner
             .data_channels

@@ -1,7 +1,6 @@
 use super::record::ProtocolVersion;
 use anyhow::{Result, bail};
 use bytes::{Buf, BufMut, Bytes, BytesMut};
-use tracing::trace;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum HandshakeType {

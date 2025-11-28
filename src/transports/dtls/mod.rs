@@ -196,7 +196,11 @@ impl Drop for DtlsTransport {
 
 impl DtlsInner {
     async fn handle_retransmit(&self, ctx: &HandshakeContext, is_client: bool) {
-        if let Some(buf) = &ctx.last_flight_buffer && is_client && ctx.message_seq == 1 && let Err(e) = self.conn.send(buf).await {
+        if let Some(buf) = &ctx.last_flight_buffer
+            && is_client
+            && ctx.message_seq == 1
+            && let Err(e) = self.conn.send(buf).await
+        {
             warn!("Retransmission failed: {}", e);
         }
     }
@@ -370,7 +374,7 @@ impl DtlsInner {
                     .await?;
             }
             HandshakeType::ClientKeyExchange => {
-                self.handle_client_key_exchange(msg, ctx, is_client).await?;
+                self.handle_client_key_exchange(msg, ctx, is_client)?;
             }
             HandshakeType::Finished => {
                 self.handle_finished(msg, raw_msg, ctx, is_client).await?;
@@ -380,11 +384,11 @@ impl DtlsInner {
                     .await?;
             }
             HandshakeType::ServerHello => {
-                self.handle_server_hello(msg, ctx, is_client).await?;
+                self.handle_server_hello(msg, ctx, is_client)?;
             }
             HandshakeType::Certificate => {}
             HandshakeType::ServerKeyExchange => {
-                self.handle_server_key_exchange(msg, ctx, is_client).await?;
+                self.handle_server_key_exchange(msg, ctx, is_client)?;
             }
             HandshakeType::ServerHelloDone => {
                 self.handle_server_hello_done(ctx, is_client).await?;
@@ -632,7 +636,7 @@ impl DtlsInner {
         Ok(())
     }
 
-    async fn handle_client_key_exchange(
+    fn handle_client_key_exchange(
         &self,
         msg: HandshakeMessage,
         ctx: &mut HandshakeContext,
@@ -935,7 +939,7 @@ impl DtlsInner {
         Ok(())
     }
 
-    async fn handle_server_hello(
+    fn handle_server_hello(
         &self,
         msg: HandshakeMessage,
         ctx: &mut HandshakeContext,
@@ -984,7 +988,7 @@ impl DtlsInner {
         Ok(())
     }
 
-    async fn handle_server_key_exchange(
+    fn handle_server_key_exchange(
         &self,
         msg: HandshakeMessage,
         ctx: &mut HandshakeContext,
@@ -1290,7 +1294,9 @@ impl DtlsInner {
         let payload = buf.freeze();
         let mut record_payload = payload;
 
-        if epoch > 0 && let Some(keys) = session_keys {
+        if epoch > 0
+            && let Some(keys) = session_keys
+        {
             let (key, iv) = if is_client {
                 (&keys.client_write_key, &keys.client_write_iv)
             } else {
