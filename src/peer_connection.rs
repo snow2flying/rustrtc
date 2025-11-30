@@ -22,6 +22,12 @@ use tokio::sync::{broadcast, mpsc, watch};
 use tracing::{debug, trace, warn};
 
 #[derive(Clone)]
+pub enum PeerConnectionEvent {
+    DataChannel(Arc<crate::transports::sctp::DataChannel>),
+    Track(Arc<RtpTransceiver>),
+}
+
+#[derive(Clone)]
 pub struct PeerConnection {
     inner: Arc<PeerConnectionInner>,
 }
@@ -47,6 +53,8 @@ struct PeerConnectionInner {
     rtp_transport: Mutex<Option<Arc<RtpTransport>>>,
     sctp_transport: Mutex<Option<Arc<SctpTransport>>>,
     data_channels: Arc<Mutex<Vec<std::sync::Weak<crate::transports::sctp::DataChannel>>>>,
+    event_tx: mpsc::UnboundedSender<PeerConnectionEvent>,
+    event_rx: tokio::sync::Mutex<mpsc::UnboundedReceiver<PeerConnectionEvent>>,
     dtls_role: watch::Sender<Option<bool>>,
     _dtls_role_rx: watch::Receiver<Option<bool>>,
     stats_collector: Arc<StatsCollector>,
@@ -70,6 +78,8 @@ impl PeerConnection {
 
         let ssrc_generator = AtomicU32::new(config.ssrc_start);
 
+        let (event_tx, event_rx) = mpsc::unbounded_channel();
+
         let inner = PeerConnectionInner {
             config,
             signaling_state: signaling_state_tx,
@@ -91,6 +101,8 @@ impl PeerConnection {
             rtp_transport: Mutex::new(None),
             sctp_transport: Mutex::new(None),
             data_channels: Arc::new(Mutex::new(Vec::new())),
+            event_tx,
+            event_rx: tokio::sync::Mutex::new(event_rx),
             dtls_role: dtls_role_tx,
             _dtls_role_rx: dtls_role_rx.clone(),
             stats_collector: Arc::new(StatsCollector::new()),
@@ -107,6 +119,7 @@ impl PeerConnection {
 
         let ice_transport_gathering = ice_transport.clone();
         let ice_gathering_state_tx = pc.inner.ice_gathering_state.clone();
+        let inner_weak_gathering = inner_weak.clone();
 
         tokio::spawn(async move {
             let gathering_loop = async {
@@ -127,6 +140,91 @@ impl PeerConnection {
                         break;
                     }
                     if state == crate::transports::ice::IceGathererState::Complete {
+                        if let Some(inner) = inner_weak_gathering.upgrade() {
+                            let mut updated = false;
+                            if inner.config.transport_mode == TransportMode::WebRtc {
+                                let candidates = ice_transport_gathering.local_candidates().await;
+                                let mut local_guard = inner.local_description.lock().unwrap();
+                                if let Some(desc) = local_guard.as_mut() {
+                                    for section in &mut desc.media_sections {
+                                        section.attributes.retain(|a| {
+                                            a.key != "candidate" && a.key != "end-of-candidates"
+                                        });
+                                        for c in &candidates {
+                                            section.attributes.push(Attribute::new(
+                                                "candidate",
+                                                Some(c.to_sdp()),
+                                            ));
+                                        }
+                                        section
+                                            .attributes
+                                            .push(Attribute::new("end-of-candidates", None));
+                                    }
+                                    updated = true;
+                                }
+                            } else {
+                                updated = true;
+                            }
+
+                            if !updated {
+                                let inner_weak_2 = inner_weak_gathering.clone();
+                                let ice_transport_2 = ice_transport_gathering.clone();
+                                tokio::spawn(async move {
+                                    if let Some(inner) = inner_weak_2.upgrade() {
+                                        let mut sig_rx = inner.signaling_state.subscribe();
+                                        loop {
+                                            let mut done = false;
+                                            if inner.config.transport_mode == TransportMode::WebRtc
+                                            {
+                                                let is_some = inner
+                                                    .local_description
+                                                    .lock()
+                                                    .unwrap()
+                                                    .is_some();
+                                                if is_some {
+                                                    let candidates =
+                                                        ice_transport_2.local_candidates().await;
+                                                    let mut local_guard =
+                                                        inner.local_description.lock().unwrap();
+                                                    if let Some(desc) = local_guard.as_mut() {
+                                                        for section in &mut desc.media_sections {
+                                                            section.attributes.retain(|a| {
+                                                                a.key != "candidate"
+                                                                    && a.key != "end-of-candidates"
+                                                            });
+                                                            for c in &candidates {
+                                                                section.attributes.push(
+                                                                    Attribute::new(
+                                                                        "candidate",
+                                                                        Some(c.to_sdp()),
+                                                                    ),
+                                                                );
+                                                            }
+                                                            section.attributes.push(
+                                                                Attribute::new(
+                                                                    "end-of-candidates",
+                                                                    None,
+                                                                ),
+                                                            );
+                                                        }
+                                                        done = true;
+                                                    }
+                                                }
+                                            } else {
+                                                done = true;
+                                            }
+
+                                            if done {
+                                                break;
+                                            }
+                                            if sig_rx.changed().await.is_err() {
+                                                break;
+                                            }
+                                        }
+                                    }
+                                });
+                            }
+                        }
                         break;
                     }
 
@@ -456,7 +554,8 @@ impl PeerConnection {
                     let receiver = Arc::new(RtpReceiver::new(kind, receiver_ssrc));
                     *t.receiver.lock().unwrap() = Some(receiver);
 
-                    transceivers.push(t);
+                    transceivers.push(t.clone());
+                    let _ = self.inner.event_tx.send(PeerConnectionEvent::Track(t));
                 }
             }
         } else if desc.sdp_type == SdpType::Answer {
@@ -601,11 +700,14 @@ impl PeerConnection {
             5000
         };
 
+        let (dc_tx, mut dc_rx) = mpsc::unbounded_channel();
+
         let (sctp, sctp_runner) = SctpTransport::new(
             dtls.clone(),
             self.inner.data_channels.clone(),
             sctp_port,
             sctp_port,
+            Some(dc_tx),
         );
         *self.inner.sctp_transport.lock().unwrap() = Some(sctp);
 
@@ -618,6 +720,19 @@ impl PeerConnection {
 
         let mut dtls_runner = Box::pin(dtls_runner);
         let mut sctp_runner = Box::pin(sctp_runner);
+
+        let inner_weak_dc = inner_weak.clone();
+        let dc_listener = async move {
+            while let Some(dc) = dc_rx.recv().await {
+                if let Some(inner) = inner_weak_dc.upgrade() {
+                    let _ = inner.event_tx.send(PeerConnectionEvent::DataChannel(dc));
+                } else {
+                    break;
+                }
+            }
+        };
+        let mut dc_listener = Box::pin(dc_listener);
+
         let mut state_rx = dtls_clone.subscribe_state();
         loop {
             let state = state_rx.borrow().clone();
@@ -795,6 +910,7 @@ impl PeerConnection {
                             _ = rtcp_loop => {},
                             _ = dtls_runner => {},
                             _ = sctp_runner => {},
+                            _ = dc_listener => {},
                         }
                     });
                     return Ok(combined);
@@ -811,6 +927,15 @@ impl PeerConnection {
                 }
                 _ = &mut sctp_runner => {
                      return Err(RtcError::Internal("SCTP runner stopped unexpectedly".into()));
+                }
+                _ = &mut dc_listener => {
+                     // DC listener stopped? Should not happen unless rx closed.
+                     // If rx closed, it means sender closed, which means SCTP transport dropped?
+                     // But we hold sctp transport.
+                     // Anyway, if it stops, we just continue?
+                     // Or maybe we should restart it?
+                     // It shouldn't stop.
+                     warn!("DataChannel listener stopped unexpectedly");
                 }
                 res = state_rx.changed() => {
                     if res.is_err() { break; }
@@ -909,9 +1034,15 @@ impl PeerConnection {
         self.inner.ice_transport.stop();
     }
 
+    pub async fn recv(&self) -> Option<PeerConnectionEvent> {
+        let mut rx = self.inner.event_rx.lock().await;
+        rx.recv().await
+    }
+
     pub fn create_data_channel(
         &self,
         label: &str,
+        config: Option<crate::transports::sctp::DataChannelConfig>,
     ) -> RtcResult<Arc<crate::transports::sctp::DataChannel>> {
         // Ensure we have an application transceiver for negotiation
         let has_app_transceiver = {
@@ -925,14 +1056,38 @@ impl PeerConnection {
             self.add_transceiver(MediaKind::Application, TransceiverDirection::SendRecv);
         }
 
-        let id = {
+        let mut config = config.unwrap_or_default();
+        config.label = label.to_string();
+
+        let id = if let Some(negotiated_id) = config.negotiated {
+            negotiated_id
+        } else {
+            let is_client = self.inner.dtls_role.borrow().unwrap_or(true);
+            let offset = if is_client { 0 } else { 1 };
+
             let channels = self.inner.data_channels.lock().unwrap();
-            channels.len() as u16
+            let mut id = offset;
+            loop {
+                let mut used = false;
+                for weak_dc in channels.iter() {
+                    if let Some(dc) = weak_dc.upgrade() {
+                        if dc.id == id {
+                            used = true;
+                            break;
+                        }
+                    }
+                }
+                if !used {
+                    break;
+                }
+                id += 2;
+            }
+            id
         };
 
         let dc = Arc::new(crate::transports::sctp::DataChannel::new(
             id,
-            label.to_string(),
+            config.clone(),
         ));
 
         self.inner
@@ -940,6 +1095,18 @@ impl PeerConnection {
             .lock()
             .unwrap()
             .push(Arc::downgrade(&dc));
+
+        if !dc.negotiated {
+            let transport = self.inner.sctp_transport.lock().unwrap().clone();
+            if let Some(transport) = transport {
+                let dc_clone = dc.clone();
+                tokio::spawn(async move {
+                    if let Err(e) = transport.send_dcep_open(&dc_clone).await {
+                        warn!("Failed to send DCEP OPEN: {}", e);
+                    }
+                });
+            }
+        }
 
         Ok(dc)
     }

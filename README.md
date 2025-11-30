@@ -24,7 +24,7 @@ async fn main() {
     let pc = PeerConnection::new(config);
 
     // Create a Data Channel
-    let dc = pc.create_data_channel("data").unwrap();
+    let dc = pc.create_data_channel("data", None).unwrap();
 
     // Handle received messages
     let dc_clone = dc.clone();
@@ -36,7 +36,16 @@ async fn main() {
         }
     });
 
-    // ... Handle SDP offer/answer exchange ...
+    // Create an offer
+    let offer = pc.create_offer().await.unwrap();
+    pc.set_local_description(offer).unwrap();
+
+    // Wait for ICE gathering to complete
+    pc.wait_for_gathering_complete().await;
+
+    // Get the complete SDP with candidates
+    let complete_offer = pc.local_description().unwrap();
+    println!("Offer SDP: {}", complete_offer.to_sdp_string());
 }
 ```
 

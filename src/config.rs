@@ -157,6 +157,7 @@ pub struct RtcConfiguration {
     pub media_capabilities: Option<MediaCapabilities>,
     pub disable_ipv6: bool,
     pub ssrc_start: u32,
+    pub stun_timeout: std::time::Duration,
 }
 
 impl Default for RtcConfiguration {
@@ -171,6 +172,7 @@ impl Default for RtcConfiguration {
             media_capabilities: None,
             disable_ipv6: false,
             ssrc_start: 10000,
+            stun_timeout: std::time::Duration::from_secs(3),
         }
     }
 }
@@ -234,6 +236,11 @@ impl RtcConfigurationBuilder {
 
     pub fn ssrc_start(mut self, start: u32) -> Self {
         self.inner.ssrc_start = start;
+        self
+    }
+
+    pub fn stun_timeout(mut self, timeout: std::time::Duration) -> Self {
+        self.inner.stun_timeout = timeout;
         self
     }
 

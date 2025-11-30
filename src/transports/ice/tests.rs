@@ -1,4 +1,5 @@
 use super::*;
+use crate::transports::PacketReceiver;
 use crate::{IceServer, IceTransportPolicy, RtcConfiguration};
 use ::turn::{
     auth::{AuthHandler, generate_auth_key},
@@ -9,7 +10,9 @@ use ::turn::{
     },
 };
 use anyhow::Result;
+use bytes::Bytes;
 use tokio::sync::broadcast;
+use tokio::time::timeout;
 // use webrtc_util::vnet::net::Net;
 type TurnResult<T> = std::result::Result<T, ::turn::Error>;
 
@@ -158,6 +161,137 @@ fn candidate_pair_priority_calculation() {
 
     assert!(prio_controlled > prio_controlling);
     assert_eq!(prio_controlled - prio_controlling, 1);
+}
+
+#[tokio::test]
+async fn turn_connection_relay_to_host() -> Result<()> {
+    let mut turn_server = TestTurnServer::start().await?;
+
+    // Agent 1: Relay only
+    let mut config1 = RtcConfiguration::default();
+    config1.ice_transport_policy = IceTransportPolicy::Relay;
+    config1.ice_servers.push(
+        IceServer::new(vec![turn_server.turn_url()]).with_credential(TEST_USERNAME, TEST_PASSWORD),
+    );
+    let (transport1, runner1) = IceTransportBuilder::new(config1)
+        .role(IceRole::Controlling)
+        .build();
+    tokio::spawn(runner1);
+
+    // Agent 2: Host only
+    let config2 = RtcConfiguration::default();
+    let (transport2, runner2) = IceTransportBuilder::new(config2)
+        .role(IceRole::Controlled)
+        .build();
+    tokio::spawn(runner2);
+
+    // Exchange candidates
+    let t1 = transport1.clone();
+    let t2 = transport2.clone();
+
+    let mut rx1 = t1.subscribe_candidates();
+    let mut rx2 = t2.subscribe_candidates();
+
+    // Add existing candidates
+    for c in t1.local_candidates().await {
+        t2.add_remote_candidate(c).await;
+    }
+    for c in t2.local_candidates().await {
+        t1.add_remote_candidate(c).await;
+    }
+
+    tokio::spawn(async move {
+        while let Ok(c) = rx1.recv().await {
+            t2.add_remote_candidate(c).await;
+        }
+    });
+    tokio::spawn(async move {
+        while let Ok(c) = rx2.recv().await {
+            t1.add_remote_candidate(c).await;
+        }
+    });
+
+    // Wait for connection
+    let state1 = transport1.subscribe_state();
+    let state2 = transport2.subscribe_state();
+
+    // Start
+    transport1
+        .start(transport2.local_parameters().await)
+        .await?;
+    transport2
+        .start(transport1.local_parameters().await)
+        .await?;
+
+    // Wait for Connected
+    let wait_connected = |mut state: watch::Receiver<IceTransportState>, name: &'static str| async move {
+        loop {
+            let s = *state.borrow_and_update();
+            if s == IceTransportState::Connected {
+                break;
+            }
+            if s == IceTransportState::Failed {
+                panic!("Transport {} failed", name);
+            }
+            if state.changed().await.is_err() {
+                panic!("Transport {} state channel closed", name);
+            }
+        }
+    };
+
+    tokio::try_join!(
+        timeout(Duration::from_secs(10), wait_connected(state1, "1")),
+        timeout(Duration::from_secs(10), wait_connected(state2, "2"))
+    )
+    .expect("Timed out waiting for connection");
+
+    // Verify selected pair on transport 1 is Relay
+    let pair1 = transport1.get_selected_pair().await.unwrap();
+    assert_eq!(pair1.local.typ, IceCandidateType::Relay);
+
+    // Send data
+    let (tx1, mut rx1_data) = tokio::sync::mpsc::channel(10);
+    let (tx2, mut rx2_data) = tokio::sync::mpsc::channel(10);
+
+    struct TestReceiver(tokio::sync::mpsc::Sender<Bytes>);
+    #[async_trait::async_trait]
+    impl PacketReceiver for TestReceiver {
+        async fn receive(&self, packet: Bytes, _addr: SocketAddr) {
+            let _ = self.0.send(packet).await;
+        }
+    }
+
+    transport1
+        .set_data_receiver(Arc::new(TestReceiver(tx1)))
+        .await;
+    transport2
+        .set_data_receiver(Arc::new(TestReceiver(tx2)))
+        .await;
+
+    let socket1 = transport1.get_selected_socket().await.unwrap();
+    let pair1 = transport1.get_selected_pair().await.unwrap();
+
+    let data = Bytes::from_static(b"hello from 1");
+    socket1.send_to(&data, pair1.remote.address).await?;
+
+    let received = timeout(Duration::from_secs(5), rx2_data.recv())
+        .await?
+        .unwrap();
+    assert_eq!(received, data);
+
+    // Send data back
+    let socket2 = transport2.get_selected_socket().await.unwrap();
+    let pair2 = transport2.get_selected_pair().await.unwrap();
+    let data2 = Bytes::from_static(b"hello from 2");
+    socket2.send_to(&data2, pair2.remote.address).await?;
+
+    let received2 = timeout(Duration::from_secs(5), rx1_data.recv())
+        .await?
+        .unwrap();
+    assert_eq!(received2, data2);
+
+    turn_server.stop().await?;
+    Ok(())
 }
 
 const TEST_USERNAME: &str = "test";

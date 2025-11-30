@@ -2,7 +2,6 @@ use anyhow::{Result, bail};
 use hmac::{Hmac, Mac};
 use sha1::Sha1;
 use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr};
-use tracing::trace;
 
 const MAGIC_COOKIE: u32 = 0x2112A442;
 const FINGERPRINT_XOR: u32 = 0x5354_554e;
@@ -144,7 +143,6 @@ fn encode_stun_message(
         let len_including_mi = (buffer.len() - 20) + 24;
         write_length_field(&mut buffer, len_including_mi);
 
-        trace!("HMAC key: {:?}", String::from_utf8_lossy(key));
         let hmac = hmac_sha1(key, &buffer);
         append_raw_attribute(&mut buffer, 0x0008, &hmac);
         update_length_field(&mut buffer);

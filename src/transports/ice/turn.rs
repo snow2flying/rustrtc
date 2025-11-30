@@ -9,10 +9,11 @@ use tokio::sync::Mutex;
 use tokio::time::timeout;
 
 use super::stun::{StunAttribute, StunClass, StunMessage, StunMethod, random_bytes};
-use super::{IceServerUri, IceTransportProtocol, MAX_STUN_MESSAGE, STUN_TIMEOUT};
+use super::{IceServerUri, IceTransportProtocol, MAX_STUN_MESSAGE};
 use crate::{IceCredentialType, IceServer};
 
 pub const DEFAULT_TURN_LIFETIME: u32 = 600;
+pub const DEFAULT_STUN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(3);
 
 #[derive(Debug, Clone)]
 pub(crate) struct TurnCredentials {
@@ -259,7 +260,7 @@ impl TurnClient {
     pub(crate) async fn recv(&self, buf: &mut [u8]) -> Result<usize> {
         match &self.transport {
             TurnTransport::Udp { socket, .. } => {
-                let (len, _) = timeout(STUN_TIMEOUT, socket.recv_from(buf)).await??;
+                let (len, _) = timeout(DEFAULT_STUN_TIMEOUT, socket.recv_from(buf)).await??;
                 Ok(len)
             }
             TurnTransport::Tcp { read, .. } => {

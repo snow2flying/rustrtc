@@ -113,7 +113,7 @@ async fn handle_rustrtc_offer(payload: OfferRequest) -> Json<OfferResponse> {
 
     // Create DataChannel (negotiated id=0)
     if !matches!(payload.mode, Mode::VideoOnly) {
-        let dc = pc.create_data_channel("echo").unwrap();
+        let dc = pc.create_data_channel("echo", None).unwrap();
 
         // Setup echo
         let pc_clone = pc.clone();
@@ -203,7 +203,10 @@ async fn start_echo(pc: PeerConnection, vp8_pt: u8) {
 
         transceiver.set_sender(Some(sender));
 
+        let pc_clone = pc.clone();
         tokio::spawn(async move {
+            // Keep PC alive
+            let _pc = pc_clone;
             loop {
                 match incoming_track.recv().await {
                     Ok(sample) => {

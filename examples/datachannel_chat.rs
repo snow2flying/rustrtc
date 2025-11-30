@@ -94,7 +94,15 @@ async fn offer(
     let pc = PeerConnection::new(config);
 
     // Use negotiated data channel with ID 0
-    let dc = pc.create_data_channel("chat").unwrap();
+    let dc = pc
+        .create_data_channel(
+            "chat",
+            Some(rustrtc::transports::sctp::DataChannelConfig {
+                negotiated: Some(0),
+                ..Default::default()
+            }),
+        )
+        .unwrap();
     let dc_clone = dc.clone();
     let pc_clone = pc.clone();
 
