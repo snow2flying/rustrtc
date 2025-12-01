@@ -17,7 +17,7 @@ import (
 type BenchResult struct {
 	Mode      string
 	Duration  time.Duration
-	Latency   float64
+	DcLatency float64
 	Bytes     uint64
 	Msgs      uint64
 	CpuUsage  float64
@@ -29,7 +29,7 @@ func (b *BenchResult) Print() {
 	fmt.Printf("Benchmark Results (%s)\n", b.Mode)
 	fmt.Println("------------------------------------------------")
 	fmt.Printf("Total Duration:      %.2fs\n", b.Duration.Seconds())
-	fmt.Printf("Connection Latency:  %.2f ms (avg)\n", b.Latency)
+	fmt.Printf("Setup Latency:       %.2f ms (avg)\n", b.DcLatency)
 	fmt.Printf("Total Data:          %.2f MB\n", float64(b.Bytes)/1024.0/1024.0)
 	fmt.Printf("Total Messages:      %d\n", b.Msgs)
 	fmt.Printf("Throughput:          %.2f MB/s\n", b.Throughput())
@@ -70,7 +70,7 @@ func runBenchmark(mode string, count int) *BenchResult {
 	peakRss, avgCpu, cpuSamples, running := startResourceMonitor()
 
 	start := time.Now()
-	latency, totalBytes, totalMsgs := runPion(count)
+	dcLatency, totalBytes, totalMsgs := runPion(count)
 	duration := time.Since(start)
 
 	atomic.StoreInt32(running, 0)
@@ -84,7 +84,7 @@ func runBenchmark(mode string, count int) *BenchResult {
 	return &BenchResult{
 		Mode:      mode,
 		Duration:  duration,
-		Latency:   latency,
+		DcLatency: dcLatency,
 		Bytes:     totalBytes,
 		Msgs:      totalMsgs,
 		CpuUsage:  avgCpuVal,
@@ -102,6 +102,7 @@ func startResourceMonitor() (*uint64, *uint64, *uint64, *int32) {
 
 	go func() {
 		for atomic.LoadInt32(running) == 1 {
+			// exec.Command is heavy, so we run it less frequently
 			cmd := exec.Command("ps", "-o", "rss,%cpu", "-p", strconv.Itoa(pid))
 			out, err := cmd.Output()
 			if err == nil {
@@ -130,7 +131,7 @@ func startResourceMonitor() (*uint64, *uint64, *uint64, *int32) {
 					}
 				}
 			}
-			time.Sleep(500 * time.Millisecond)
+			time.Sleep(2000 * time.Millisecond)
 		}
 	}()
 
@@ -141,7 +142,7 @@ func runPion(count int) (float64, uint64, uint64) {
 	var wg sync.WaitGroup
 	var totalBytes uint64
 	var totalMsgs uint64
-	var totalLatency uint64
+	var totalDcLatency uint64
 
 	// Limit concurrency to avoid file descriptor limits or excessive resource usage if count is high
 	// The rust version spawns all at once, but let's be safe or just match it.
@@ -244,7 +245,6 @@ func runPion(count int) (float64, uint64, uint64) {
 			}
 
 			// Wait for connection
-			connStart := time.Now()
 			connected := make(chan struct{})
 			pc1.OnConnectionStateChange(func(s webrtc.PeerConnectionState) {
 				if s == webrtc.PeerConnectionStateConnected {
@@ -265,10 +265,8 @@ func runPion(count int) (float64, uint64, uint64) {
 				return
 			}
 
-			latency := time.Since(connStart).Milliseconds()
-			atomic.AddUint64(&totalLatency, uint64(latency))
-
 			// Wait for DC open
+			dcWaitStart := time.Now()
 			dcOpen := make(chan struct{})
 			dc1.OnOpen(func() {
 				close(dcOpen)
@@ -282,19 +280,38 @@ func runPion(count int) (float64, uint64, uint64) {
 				pc2.Close()
 				return
 			}
+			dcLatency := time.Since(dcWaitStart).Milliseconds()
+			atomic.AddUint64(&totalDcLatency, uint64(dcLatency))
 
 			// Send data
 			data := make([]byte, 1024)
 			startSend := time.Now()
 			duration := 10 * time.Second
 
+			// Configure backpressure
+			threshold := uint64(100 * 1024)
+			dc1.SetBufferedAmountLowThreshold(threshold)
+
+			// Channel to signal when we can send again
+			canSend := make(chan struct{}, 1)
+			// Initially we can send
+			canSend <- struct{}{}
+
+			dc1.OnBufferedAmountLow(func() {
+				select {
+				case canSend <- struct{}{}:
+				default:
+				}
+			})
+
 			for time.Since(startSend) < duration {
+				if dc1.BufferedAmount() > threshold {
+					<-canSend
+				}
 				if err := dc1.Send(data); err != nil {
+					log.Printf("Send error: %v\n", err)
 					break
 				}
-				// No explicit yield needed in Go usually, but maybe small sleep if buffer fills up?
-				// Pion's Send might block or error if buffer is full.
-				// For benchmark, we just blast.
 			}
 
 			pc1.Close()
@@ -309,10 +326,10 @@ func runPion(count int) (float64, uint64, uint64) {
 
 	wg.Wait()
 
-	avgLatency := 0.0
+	avgDcLatency := 0.0
 	if count > 0 {
-		avgLatency = float64(atomic.LoadUint64(&totalLatency)) / float64(count)
+		avgDcLatency = float64(atomic.LoadUint64(&totalDcLatency)) / float64(count)
 	}
 
-	return avgLatency, atomic.LoadUint64(&totalBytes), atomic.LoadUint64(&totalMsgs)
+	return avgDcLatency, atomic.LoadUint64(&totalBytes), atomic.LoadUint64(&totalMsgs)
 }

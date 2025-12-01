@@ -4,8 +4,8 @@ use anyhow::Result;
 use async_trait::async_trait;
 use bytes::Bytes;
 use std::net::SocketAddr;
-use std::sync::{Arc, Weak};
-use tokio::sync::{RwLock, watch};
+use std::sync::{Arc, RwLock, Weak};
+use tokio::sync::watch;
 use tracing::debug;
 
 pub struct IceConn {
@@ -31,63 +31,53 @@ impl IceConn {
     }
 
     pub async fn set_remote_rtcp_addr(&self, addr: Option<SocketAddr>) {
-        *self.remote_rtcp_addr.write().await = addr;
+        *self.remote_rtcp_addr.write().unwrap() = addr;
     }
 
     pub async fn set_dtls_receiver(&self, receiver: Arc<dyn PacketReceiver>) {
-        *self.dtls_receiver.write().await = Some(Arc::downgrade(&receiver));
+        *self.dtls_receiver.write().unwrap() = Some(Arc::downgrade(&receiver));
     }
 
     pub async fn set_rtp_receiver(&self, receiver: Arc<dyn PacketReceiver>) {
-        *self.rtp_receiver.write().await = Some(Arc::downgrade(&receiver));
+        *self.rtp_receiver.write().unwrap() = Some(Arc::downgrade(&receiver));
     }
 
     pub async fn send(&self, buf: &[u8]) -> Result<usize> {
-        let mut socket_rx = self.socket_rx.clone();
-        let mut socket_opt = socket_rx.borrow_and_update().clone();
-
-        if socket_opt.is_none() {
-            tracing::debug!("IceConn: waiting for socket... (initial check)");
-            match tokio::time::timeout(std::time::Duration::from_secs(2), socket_rx.changed()).await
-            {
-                Ok(Ok(())) => {
-                    socket_opt = socket_rx.borrow().clone();
-                    if socket_opt.is_some() {
-                        tracing::debug!("IceConn: socket became available");
-                    } else {
-                        tracing::warn!("IceConn: socket changed but is still None");
-                    }
-                }
-                Ok(Err(_)) => {
-                    tracing::warn!("IceConn: socket_rx channel closed");
-                }
-                Err(_) => {
-                    tracing::warn!("IceConn: timeout waiting for socket");
-                }
-            }
-        }
+        let socket_rx = self.socket_rx.clone();
+        let socket_opt = socket_rx.borrow().clone();
 
         if let Some(socket) = socket_opt {
-            let remote = *self.remote_addr.read().await;
+            let remote = *self.remote_addr.read().unwrap();
             if remote.port() == 0 {
                 return Err(anyhow::anyhow!("Remote address not set"));
             }
             socket.send_to(buf, remote).await
         } else {
-            tracing::warn!("IceConn: send failed - no selected socket");
-            Err(anyhow::anyhow!("No selected socket"))
+            // Fallback: try to update if None
+            let mut socket_rx = self.socket_rx.clone();
+            let socket_opt = socket_rx.borrow_and_update().clone();
+            if let Some(socket) = socket_opt {
+                let remote = *self.remote_addr.read().unwrap();
+                if remote.port() == 0 {
+                    return Err(anyhow::anyhow!("Remote address not set"));
+                }
+                socket.send_to(buf, remote).await
+            } else {
+                tracing::warn!("IceConn: send failed - no selected socket");
+                Err(anyhow::anyhow!("No selected socket"))
+            }
         }
     }
 
     pub async fn send_rtcp(&self, buf: &[u8]) -> Result<usize> {
-        let mut socket_rx = self.socket_rx.clone();
-        let socket_opt = socket_rx.borrow_and_update().clone();
+        let socket_rx = self.socket_rx.clone();
+        let socket_opt = socket_rx.borrow().clone();
 
         if let Some(socket) = socket_opt {
-            let remote = if let Some(rtcp_addr) = *self.remote_rtcp_addr.read().await {
+            let remote = if let Some(rtcp_addr) = *self.remote_rtcp_addr.read().unwrap() {
                 rtcp_addr
             } else {
-                *self.remote_addr.read().await
+                *self.remote_addr.read().unwrap()
             };
 
             if remote.port() == 0 {
@@ -95,8 +85,24 @@ impl IceConn {
             }
             socket.send_to(buf, remote).await
         } else {
-            tracing::warn!("IceConn: send_rtcp failed - no selected socket");
-            Err(anyhow::anyhow!("No selected socket"))
+             // Fallback
+            let mut socket_rx = self.socket_rx.clone();
+            let socket_opt = socket_rx.borrow_and_update().clone();
+            if let Some(socket) = socket_opt {
+                let remote = if let Some(rtcp_addr) = *self.remote_rtcp_addr.read().unwrap() {
+                    rtcp_addr
+                } else {
+                    *self.remote_addr.read().unwrap()
+                };
+
+                if remote.port() == 0 {
+                    return Err(anyhow::anyhow!("Remote address not set"));
+                }
+                socket.send_to(buf, remote).await
+            } else {
+                tracing::warn!("IceConn: send_rtcp failed - no selected socket");
+                Err(anyhow::anyhow!("No selected socket"))
+            }
         }
     }
 }
@@ -109,26 +115,22 @@ impl PacketReceiver for IceConn {
         }
 
         let first_byte = packet[0];
-        let current_remote = *self.remote_addr.read().await;
+        
+        // Scope for read lock
+        let current_remote = *self.remote_addr.read().unwrap();
 
         // If remote_addr is unspecified (port 0), accept and update
         if current_remote.port() == 0 {
-            *self.remote_addr.write().await = addr;
+            *self.remote_addr.write().unwrap() = addr;
         } else if addr != current_remote {
             // Only allow updating remote address for DTLS packets (20-63).
-            // We explicitly disallow RTP (128-191) from changing the remote address
-            // to prevent hijacking/race conditions during flooding.
-            // In a full ICE implementation, address changes should be handled via STUN checks.
             if (20..64).contains(&first_byte) {
                 debug!(
                     "IceConn: Remote address changed from {:?} to {:?} (DTLS)",
                     current_remote, addr
                 );
-                *self.remote_addr.write().await = addr;
+                *self.remote_addr.write().unwrap() = addr;
             } else {
-                // For RTP, we ignore the address change but still process the packet
-                // (it might be from the valid peer but we haven't switched yet, or it might be junk/attack)
-                // We log at trace level to avoid spamming logs during flood
                 tracing::trace!(
                     "IceConn: Received packet from new address {:?} but ignoring address change (byte={})",
                     addr,
@@ -139,18 +141,32 @@ impl PacketReceiver for IceConn {
 
         if (20..64).contains(&first_byte) {
             // DTLS
-            if let Some(rx) = &*self.dtls_receiver.read().await {
-                if let Some(strong_rx) = rx.upgrade() {
-                    strong_rx.receive(packet, addr).await;
+            let receiver = {
+                let rx_lock = self.dtls_receiver.read().unwrap();
+                if let Some(rx) = &*rx_lock {
+                    rx.upgrade()
+                } else {
+                    None
                 }
+            };
+
+            if let Some(strong_rx) = receiver {
+                strong_rx.receive(packet, addr).await;
             } else {
                 debug!("IceConn: Received DTLS packet but no receiver registered");
             }
         } else if (128..192).contains(&first_byte) {
             // RTP / RTCP
-            if let Some(rx) = &*self.rtp_receiver.read().await
-                && let Some(strong_rx) = rx.upgrade()
-            {
+            let receiver = {
+                let rx_lock = self.rtp_receiver.read().unwrap();
+                if let Some(rx) = &*rx_lock {
+                    rx.upgrade()
+                } else {
+                    None
+                }
+            };
+
+            if let Some(strong_rx) = receiver {
                 strong_rx.receive(packet, addr).await;
             }
         }

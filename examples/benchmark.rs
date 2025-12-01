@@ -25,7 +25,7 @@ use webrtc::track::track_local::track_local_static_sample::TrackLocalStaticSampl
 struct BenchResult {
     mode: String,
     duration: Duration,
-    latency: f64,
+    dc_latency: f64,
     bytes: u64,
     msgs: u64,
     cpu_usage: f64,
@@ -38,7 +38,7 @@ impl BenchResult {
         println!("Benchmark Results ({})", self.mode);
         println!("------------------------------------------------");
         println!("Total Duration:      {:.2?}", self.duration);
-        println!("Connection Latency:  {:.2} ms (avg)", self.latency);
+        println!("Setup Latency:       {:.2} ms (avg)", self.dc_latency);
         println!("Total Data:          {:.2} MB", self.bytes as f64 / 1024.0 / 1024.0);
         println!("Total Messages:      {}", self.msgs);
         println!("Throughput:          {:.2} MB/s", self.throughput());
@@ -148,7 +148,7 @@ async fn main() {
 
 fn parse_output(output: &str, mode: &str) -> Option<BenchResult> {
     let mut duration = Duration::from_secs(0);
-    let mut latency = 0.0;
+    let mut dc_latency = 0.0;
     let mut bytes = 0;
     let mut msgs = 0;
     let mut cpu_usage = 0.0;
@@ -164,11 +164,11 @@ fn parse_output(output: &str, mode: &str) -> Option<BenchResult> {
                     duration = Duration::from_secs_f64(secs);
                 }
             }
-        } else if line.starts_with("Connection Latency:") {
-            // Format: Connection Latency:  4.00 ms (avg)
+        } else if line.starts_with("Setup Latency:") {
+            // Format: Setup Latency:       4.00 ms (avg)
             if let Some(val) = line.split_whitespace().nth(2) {
                 if let Ok(v) = val.parse::<f64>() {
-                    latency = v;
+                    dc_latency = v;
                 }
             }
         } else if line.starts_with("Total Data:") {
@@ -206,7 +206,7 @@ fn parse_output(output: &str, mode: &str) -> Option<BenchResult> {
     Some(BenchResult {
         mode: mode.to_string(),
         duration,
-        latency,
+        dc_latency,
         bytes,
         msgs,
         cpu_usage,
@@ -221,7 +221,7 @@ async fn run_benchmark(mode: &str, count: usize) -> BenchResult {
     let (peak_rss, avg_cpu, cpu_samples, running) = start_resource_monitor();
     
     let start = Instant::now();
-    let (latency, bytes, msgs) = match mode {
+    let (dc_latency, bytes, msgs) = match mode {
         "rustrtc" => run_rustrtc(count).await,
         "webrtc" => run_webrtc(count).await,
         _ => panic!("Unknown mode. Use 'rustrtc' or 'webrtc'"),
@@ -240,7 +240,7 @@ async fn run_benchmark(mode: &str, count: usize) -> BenchResult {
     BenchResult {
         mode: mode.to_string(),
         duration,
-        latency,
+        dc_latency,
         bytes,
         msgs,
         cpu_usage: avg_cpu_val,
@@ -343,7 +343,7 @@ fn print_comparison_table(results: &[BenchResult]) {
     
     let metrics = [
         ("Duration (s)", Box::new(|r: &BenchResult| r.duration.as_secs_f64()) as Box<dyn Fn(&BenchResult) -> f64>),
-        ("Latency (ms)", Box::new(|r: &BenchResult| r.latency)),
+        ("Setup Latency (ms)", Box::new(|r: &BenchResult| r.dc_latency)),
         ("Throughput (MB/s)", Box::new(|r: &BenchResult| r.throughput())),
         ("Msg Rate (msg/s)", Box::new(|r: &BenchResult| r.msg_rate())),
         ("CPU Usage (%)", Box::new(|r: &BenchResult| r.cpu_usage)),
@@ -368,7 +368,7 @@ fn print_bar_charts(results: &[BenchResult]) {
     let metrics = [
         ("Throughput (MB/s)", true, Box::new(|r: &BenchResult| r.throughput()) as Box<dyn Fn(&BenchResult) -> f64>),
         ("Message Rate (msg/s)", true, Box::new(|r: &BenchResult| r.msg_rate())),
-        ("Latency (ms)", false, Box::new(|r: &BenchResult| r.latency)),
+        ("Setup Latency (ms)", false, Box::new(|r: &BenchResult| r.dc_latency)),
         ("CPU Usage (%)", false, Box::new(|r: &BenchResult| r.cpu_usage)),
         ("Memory (MB)", false, Box::new(|r: &BenchResult| r.memory_rss as f64)),
     ];
@@ -407,7 +407,7 @@ async fn run_rustrtc(count: usize) -> (f64, u64, u64) {
     let mut handles = vec![];
     let total_bytes = Arc::new(AtomicU64::new(0));
     let total_msgs = Arc::new(AtomicU64::new(0));
-    let total_latency = Arc::new(AtomicU64::new(0)); // in ms
+    let total_dc_latency = Arc::new(AtomicU64::new(0)); // in micros
 
     let pb = ProgressBar::new(count as u64);
     pb.set_style(ProgressStyle::default_bar()
@@ -418,7 +418,7 @@ async fn run_rustrtc(count: usize) -> (f64, u64, u64) {
     for _ in 0..count {
         let total_bytes = total_bytes.clone();
         let total_msgs = total_msgs.clone();
-        let total_latency = total_latency.clone();
+        let total_dc_latency = total_dc_latency.clone();
         let pb = pb.clone();
         
         handles.push(tokio::spawn(async move {
@@ -430,7 +430,7 @@ async fn run_rustrtc(count: usize) -> (f64, u64, u64) {
             let (_source, track) = sample_track(MediaKind::Audio, 100);
             pc1.add_track(track).unwrap();
 
-            let _ = pc1.create_data_channel("bench", None).unwrap();
+            let dc1 = pc1.create_data_channel("bench", None).unwrap();
 
             // Exchange SDP
             let offer = pc1.create_offer().await.unwrap();
@@ -448,7 +448,6 @@ async fn run_rustrtc(count: usize) -> (f64, u64, u64) {
             pc1.set_remote_description(answer).await.unwrap();
 
             // Wait for connection
-            let conn_start = Instant::now();
             if let Err(_) = tokio::time::timeout(Duration::from_secs(10), pc1.wait_for_connection()).await {
                 // println!("Timeout waiting for pc1 connection");
                 return;
@@ -457,10 +456,23 @@ async fn run_rustrtc(count: usize) -> (f64, u64, u64) {
                 // println!("Timeout waiting for pc2 connection");
                 return;
             }
-            let latency = conn_start.elapsed().as_millis() as u64;
-            total_latency.fetch_add(latency, Ordering::Relaxed);
 
-            let dc1 = pc1.create_data_channel("bench", None).unwrap();
+            // Wait for DC1 open
+            let dc_wait_start = Instant::now();
+            let mut dc1_open = false;
+            while let Some(event) = dc1.recv().await {
+                if let DataChannelEvent::Open = event {
+                    dc1_open = true;
+                    break;
+                }
+            }
+            if !dc1_open {
+                // println!("Failed to open data channel");
+                pb.inc(1);
+                return;
+            }
+            let dc_latency = dc_wait_start.elapsed().as_micros() as u64;
+            total_dc_latency.fetch_add(dc_latency, Ordering::Relaxed);
 
             // Get DC2
             let mut dc2 = None;
@@ -548,7 +560,7 @@ async fn run_rustrtc(count: usize) -> (f64, u64, u64) {
     pb.finish_with_message("Done");
 
     (
-        total_latency.load(Ordering::Relaxed) as f64 / count as f64,
+        total_dc_latency.load(Ordering::Relaxed) as f64 / count as f64 / 1000.0,
         total_bytes.load(Ordering::Relaxed),
         total_msgs.load(Ordering::Relaxed)
     )
@@ -558,7 +570,7 @@ async fn run_webrtc(count: usize) -> (f64, u64, u64) {
     let mut handles = vec![];
     let total_bytes = Arc::new(AtomicU64::new(0));
     let total_msgs = Arc::new(AtomicU64::new(0));
-    let total_latency = Arc::new(AtomicU64::new(0));
+    let total_dc_latency = Arc::new(AtomicU64::new(0));
 
     let pb = ProgressBar::new(count as u64);
     pb.set_style(ProgressStyle::default_bar()
@@ -569,7 +581,7 @@ async fn run_webrtc(count: usize) -> (f64, u64, u64) {
     for _ in 0..count {
         let total_bytes = total_bytes.clone();
         let total_msgs = total_msgs.clone();
-        let total_latency = total_latency.clone();
+        let total_dc_latency = total_dc_latency.clone();
         let pb = pb.clone();
         
         handles.push(tokio::spawn(async move {
@@ -611,12 +623,11 @@ async fn run_webrtc(count: usize) -> (f64, u64, u64) {
             let done = Arc::new(Notify::new());
             let done_clone = done.clone();
             let total_bytes_clone = total_bytes.clone();
-            let total_msgs_clone = total_msgs.clone();
 
             pc2.on_data_channel(Box::new(move |dc2| {
                 let done_clone = done_clone.clone();
                 let total_bytes_clone = total_bytes_clone.clone();
-                let total_msgs_clone = total_msgs_clone.clone();
+                let total_msgs_clone = total_msgs.clone();
                 Box::pin(async move {
                     let done_clone2 = done_clone.clone();
                     
@@ -655,8 +666,6 @@ async fn run_webrtc(count: usize) -> (f64, u64, u64) {
             pc1.set_remote_description(answer).await.unwrap();
 
             // Wait for connection
-            let conn_start = Instant::now();
-            
             let (tx, mut rx) = tokio::sync::mpsc::channel(1);
             let tx = Arc::new(tx);
             let tx_clone = tx.clone();
@@ -671,10 +680,9 @@ async fn run_webrtc(count: usize) -> (f64, u64, u64) {
             }));
             
             let _ = rx.recv().await;
-            let latency = conn_start.elapsed().as_millis() as u64;
-            total_latency.fetch_add(latency, Ordering::Relaxed);
 
             // Wait for open
+            let dc_wait_start = Instant::now();
             let (tx_open, mut rx_open) = tokio::sync::mpsc::channel(1);
             dc1.on_open(Box::new(move || {
                 Box::pin(async move {
@@ -683,6 +691,8 @@ async fn run_webrtc(count: usize) -> (f64, u64, u64) {
             }));
 
             let _ = rx_open.recv().await;
+            let dc_latency = dc_wait_start.elapsed().as_micros() as u64;
+            total_dc_latency.fetch_add(dc_latency, Ordering::Relaxed);
 
             let data = bytes::Bytes::from(vec![0u8; 1024]);
             let start_send = Instant::now();
@@ -707,8 +717,10 @@ async fn run_webrtc(count: usize) -> (f64, u64, u64) {
     pb.finish_with_message("Done");
 
     (
-        total_latency.load(Ordering::Relaxed) as f64 / count as f64,
+        total_dc_latency.load(Ordering::Relaxed) as f64 / count as f64 / 1000.0,
         total_bytes.load(Ordering::Relaxed),
         total_msgs.load(Ordering::Relaxed)
     )
 }
+
+

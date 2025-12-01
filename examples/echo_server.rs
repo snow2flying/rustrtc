@@ -127,7 +127,7 @@ async fn handle_rustrtc_offer(payload: OfferRequest) -> Json<OfferResponse> {
                         let pc = pc_clone.clone();
                         tokio::spawn(async move {
                             // Echo back
-                            let res = if let Ok(text) = String::from_utf8(data.clone()) {
+                            let res = if let Ok(text) = String::from_utf8(data.to_vec()) {
                                 pc.send_text(0, &text).await
                             } else {
                                 pc.send_data(0, &data).await

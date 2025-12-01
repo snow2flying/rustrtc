@@ -158,6 +158,7 @@ pub struct RtcConfiguration {
     pub disable_ipv6: bool,
     pub ssrc_start: u32,
     pub stun_timeout: std::time::Duration,
+    pub dtls_buffer_size: usize,
 }
 
 impl Default for RtcConfiguration {
@@ -173,6 +174,7 @@ impl Default for RtcConfiguration {
             disable_ipv6: false,
             ssrc_start: 10000,
             stun_timeout: std::time::Duration::from_secs(3),
+            dtls_buffer_size: 100,
         }
     }
 }
@@ -241,6 +243,11 @@ impl RtcConfigurationBuilder {
 
     pub fn stun_timeout(mut self, timeout: std::time::Duration) -> Self {
         self.inner.stun_timeout = timeout;
+        self
+    }
+
+    pub fn dtls_buffer_size(mut self, size: usize) -> Self {
+        self.inner.dtls_buffer_size = size;
         self
     }
 

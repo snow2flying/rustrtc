@@ -11,28 +11,28 @@ A pure Rust implementation of WebRTC.
 - **DTLS**: Datagram Transport Layer Security for secure communication.
 - **SDP**: Session Description Protocol parsing and generation.
 
-## Performance (vs webrtc.rs)
+## Performance (vs webrtc-rs & pion)
 > From Apple M4 machine result
 
 ```shell
 mpi@mpis-MacBook-Air rustrtc % cargo build --release --example benchmark && ./target/release/examples/benchmark
 
-Comparison (Baseline: webrtc.rs)
-Metric               | webrtc.rs       | rustrtc         | Diff            | Diff %         
-------------------------------------------------------------------------------------------
-Duration (s)         | 10.02           | 10.01           |    -0.01        |    -0.10%      
-Latency (ms)         | 3.30            | 3.00            |    -0.30        |    -9.09%      
-Throughput (MB/s)    | 138.31          | 171.87          |   +33.56        |   +24.26%      
-Msg Rate (msg/s)     | 141633.13       | 175996.60       | +34363.47       |   +24.26%      
-CPU Usage (%)        | 847.72          | 844.07          |    -3.65        |    -0.43%      
-Memory (MB)          | 27.00           | 11.00           |   -16.00        |   -59.26%      
-------------------------------------------------------------------------------------------
+Comparison (Baseline: webrtc)
+Metric               | webrtc     | rustrtc    | pion      
+--------------------------------------------------------------------------------
+Duration (s)         | 10.02      | 10.02      | 11.02     
+Setup Latency (ms)   | 1.14       | 0.69       | 1.80      
+Throughput (MB/s)    | 135.45     | 213.38     | 177.92    
+Msg Rate (msg/s)     | 138696.71  | 218497.60  | 182190.56 
+CPU Usage (%)        | 820.38     | 829.33     | 596.12    
+Memory (MB)          | 28.00      | 10.00      | 41.00     
+--------------------------------------------------------------------------------
 ```
 
 **Key Findings:**
-- **Throughput**: `rustrtc` is ~24% faster than `webrtc.rs`.
-- **Memory**: `rustrtc` uses ~60% less memory.
-- **Latency**: Slightly improved (-9%).
+- **Throughput**: `rustrtc` is ~57% faster than `webrtc-rs` and ~20% faster than `pion`.
+- **Memory**: `rustrtc` uses ~64% less memory than `webrtc-rs` and ~75% less than `pion`.
+- **Setup Latency**: Significantly faster connection setup (0.69ms vs 1.14ms/1.80ms).
 
 
 ## Usage

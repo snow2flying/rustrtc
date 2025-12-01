@@ -653,7 +653,7 @@ impl PeerConnection {
 
         let rtp_transport = Arc::new(RtpTransport::new(ice_conn.clone()));
         {
-            let mut rx = ice_conn.rtp_receiver.write().await;
+            let mut rx = ice_conn.rtp_receiver.write().unwrap();
             *rx = Some(Arc::downgrade(&rtp_transport)
                 as std::sync::Weak<dyn crate::transports::PacketReceiver>);
         }
@@ -685,10 +685,14 @@ impl PeerConnection {
             return Ok(Box::pin(async {}));
         }
 
-        let (dtls, dtls_runner) =
-            DtlsTransport::new(ice_conn, self.inner.certificate.as_ref().clone(), is_client)
-                .await
-                .map_err(|e| RtcError::Internal(format!("DTLS failed: {}", e)))?;
+        let (dtls, incoming_data_rx, dtls_runner) = DtlsTransport::new(
+            ice_conn,
+            self.inner.certificate.as_ref().clone(),
+            is_client,
+            self.config().dtls_buffer_size,
+        )
+        .await
+        .map_err(|e| RtcError::Internal(format!("DTLS failed: {}", e)))?;
 
         let sctp_port = if let Some(caps) = &self.config().media_capabilities {
             if let Some(app) = &caps.application {
@@ -704,10 +708,12 @@ impl PeerConnection {
 
         let (sctp, sctp_runner) = SctpTransport::new(
             dtls.clone(),
+            incoming_data_rx,
             self.inner.data_channels.clone(),
             sctp_port,
             sctp_port,
             Some(dc_tx),
+            is_client,
         );
         *self.inner.sctp_transport.lock().unwrap() = Some(sctp);
 
@@ -2192,7 +2198,7 @@ mod tests {
         // Now check IceConn
         let rtp_transport = pc.inner.rtp_transport.lock().unwrap().clone().unwrap();
         let ice_conn = rtp_transport.ice_conn();
-        let rtcp_addr = *ice_conn.remote_rtcp_addr.read().await;
+        let rtcp_addr = *ice_conn.remote_rtcp_addr.read().unwrap();
 
         assert!(rtcp_addr.is_some());
         assert_eq!(rtcp_addr.unwrap().port(), 4001);
@@ -2229,7 +2235,7 @@ mod tests {
 
         let rtp_transport = pc.inner.rtp_transport.lock().unwrap().clone().unwrap();
         let ice_conn = rtp_transport.ice_conn();
-        let rtcp_addr = *ice_conn.remote_rtcp_addr.read().await;
+        let rtcp_addr = *ice_conn.remote_rtcp_addr.read().unwrap();
 
         assert!(rtcp_addr.is_none());
     }

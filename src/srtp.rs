@@ -11,6 +11,7 @@ use ctr::cipher::{KeyIvInit, StreamCipher, generic_array::GenericArray};
 use hmac::{Hmac, Mac};
 use sha1::Sha1;
 use std::collections::HashMap;
+use std::fmt;
 
 type Aes128Ctr = ctr::Ctr128BE<Aes128>;
 type HmacSha1 = Hmac<Sha1>;
@@ -170,16 +171,28 @@ struct SessionKeys {
     salt: Vec<u8>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct SrtpContext {
     ssrc: u32,
     _profile: SrtpProfile,
     rtp_keys: SessionKeys,
     rtcp_keys: SessionKeys,
+    rtp_gcm_cipher: Option<Aes128Gcm>,
     direction: SrtpDirection,
     rollover_counter: u32,
     last_sequence: Option<u16>,
     rtcp_index: u32,
+}
+
+impl fmt::Debug for SrtpContext {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("SrtpContext")
+            .field("ssrc", &self.ssrc)
+            .field("_profile", &self._profile)
+            .field("direction", &self.direction)
+            .field("rollover_counter", &self.rollover_counter)
+            .finish()
+    }
 }
 
 impl SrtpContext {
@@ -197,11 +210,21 @@ impl SrtpContext {
 
         let (rtp_keys, rtcp_keys) = Self::derive_keys(profile, &keying)?;
 
+        let rtp_gcm_cipher = if let SrtpProfile::AeadAes128Gcm = profile {
+            Some(
+                Aes128Gcm::new_from_slice(&rtp_keys.cipher_key)
+                    .map_err(|_| SrtpError::UnsupportedProfile)?,
+            )
+        } else {
+            None
+        };
+
         Ok(Self {
             ssrc,
             _profile: profile,
             rtp_keys,
             rtcp_keys,
+            rtp_gcm_cipher,
             direction,
             rollover_counter: 0,
             last_sequence: None,
@@ -385,8 +408,10 @@ impl SrtpContext {
 
         if let SrtpProfile::AeadAes128Gcm = self._profile {
             let nonce = self.build_gcm_nonce(packet.header.sequence_number, roc);
-            let cipher = Aes128Gcm::new_from_slice(&self.rtp_keys.cipher_key)
-                .map_err(|_| SrtpError::UnsupportedProfile)?;
+            let cipher = self
+                .rtp_gcm_cipher
+                .as_ref()
+                .ok_or(SrtpError::UnsupportedProfile)?;
 
             // For GCM, AAD is the RTP header.
             let original_payload = std::mem::take(&mut packet.payload);
@@ -425,8 +450,10 @@ impl SrtpContext {
 
         if let SrtpProfile::AeadAes128Gcm = self._profile {
             let nonce = self.build_gcm_nonce(packet.header.sequence_number, roc);
-            let cipher = Aes128Gcm::new_from_slice(&self.rtp_keys.cipher_key)
-                .map_err(|_| SrtpError::UnsupportedProfile)?;
+            let cipher = self
+                .rtp_gcm_cipher
+                .as_ref()
+                .ok_or(SrtpError::UnsupportedProfile)?;
 
             // Separate payload (ciphertext + tag) from header for AAD
             let original_payload = std::mem::take(&mut packet.payload);

@@ -51,8 +51,8 @@ struct IceTransportInner {
     local_parameters: std::sync::Mutex<IceParameters>,
     remote_parameters: std::sync::Mutex<Option<IceParameters>>,
     pending_transactions: std::sync::Mutex<HashMap<[u8; 12], oneshot::Sender<StunDecoded>>>,
-    data_receiver: Mutex<Option<Arc<dyn PacketReceiver>>>,
-    buffered_packets: Mutex<Vec<(Vec<u8>, SocketAddr)>>,
+    data_receiver: std::sync::Mutex<Option<Arc<dyn PacketReceiver>>>,
+    buffered_packets: std::sync::Mutex<Vec<(Vec<u8>, SocketAddr)>>,
     selected_socket: watch::Sender<Option<IceSocketWrapper>>,
     _socket_rx_keeper: watch::Receiver<Option<IceSocketWrapper>>,
     last_received: std::sync::Mutex<Instant>,
@@ -93,7 +93,10 @@ struct IceTransportRunner {
 
 impl IceTransportRunner {
     async fn run(mut self) {
-        let mut interval = tokio::time::interval(Duration::from_secs(1));
+        let mut interval = tokio::time::interval_at(
+            tokio::time::Instant::now() + Duration::from_secs(1),
+            Duration::from_secs(1),
+        );
         let mut read_futures: FuturesUnordered<BoxFuture<'static, ()>> = FuturesUnordered::new();
         let mut gathering_future: BoxFuture<'static, ()> = Box::pin(futures::future::pending());
 
@@ -301,8 +304,8 @@ impl IceTransport {
             local_parameters: std::sync::Mutex::new(IceParameters::generate()),
             remote_parameters: std::sync::Mutex::new(None),
             pending_transactions: std::sync::Mutex::new(HashMap::new()),
-            data_receiver: Mutex::new(None),
-            buffered_packets: Mutex::new(Vec::new()),
+            data_receiver: std::sync::Mutex::new(None),
+            buffered_packets: std::sync::Mutex::new(Vec::new()),
             selected_socket: selected_socket_tx,
             _socket_rx_keeper: selected_socket_rx,
             last_received: std::sync::Mutex::new(Instant::now()),
@@ -469,16 +472,22 @@ impl IceTransport {
     }
 
     pub async fn set_data_receiver(&self, receiver: Arc<dyn PacketReceiver>) {
-        let mut rx_lock = self.inner.data_receiver.lock().await;
-        *rx_lock = Some(receiver.clone());
-        drop(rx_lock);
+        {
+            let mut rx_lock = self.inner.data_receiver.lock().unwrap();
+            *rx_lock = Some(receiver.clone());
+        }
 
-        let mut buffer = self.inner.buffered_packets.lock().await;
-        if !buffer.is_empty() {
-            debug!("Flushing {} buffered packets", buffer.len());
-            for (packet, addr) in buffer.drain(..) {
-                receiver.receive(Bytes::from(packet), addr).await;
+        let packets: Vec<_> = {
+            let mut buffer = self.inner.buffered_packets.lock().unwrap();
+            if buffer.is_empty() {
+                return;
             }
+            debug!("Flushing {} buffered packets", buffer.len());
+            buffer.drain(..).collect()
+        };
+
+        for (packet, addr) in packets {
+            receiver.receive(Bytes::from(packet), addr).await;
         }
     }
 
@@ -680,11 +689,11 @@ async fn handle_packet(
         }
     } else {
         // DTLS or RTP
-        let receiver = inner.data_receiver.lock().await.clone();
+        let receiver = inner.data_receiver.lock().unwrap().clone();
         if let Some(rx) = receiver {
             rx.receive(Bytes::copy_from_slice(packet), addr).await;
         } else {
-            let mut buffer = inner.buffered_packets.lock().await;
+            let mut buffer = inner.buffered_packets.lock().unwrap();
             if buffer.len() < 100 {
                 buffer.push((packet.to_vec(), addr));
             } else {

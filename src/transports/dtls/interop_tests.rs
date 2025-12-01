@@ -76,7 +76,7 @@ async fn test_interop_rustrtc_client_webrtc_server() -> Result<()> {
     });
 
     let cert = generate_certificate()?;
-    let (client_dtls, runner) = DtlsTransport::new(client_conn, cert, true).await?;
+    let (client_dtls, mut incoming_rx, runner) = DtlsTransport::new(client_conn, cert, true, 1500).await?;
     tokio::spawn(runner);
 
     // Wait for handshake
@@ -98,13 +98,13 @@ async fn test_interop_rustrtc_client_webrtc_server() -> Result<()> {
 
     // Receive echo
     info!("rustrtc client waiting for echo...");
-    let echo = client_dtls.recv().await?;
+    let echo = incoming_rx.recv().await.ok_or(anyhow::anyhow!("Channel closed"))?;
     info!(
         "rustrtc client received: {:?}",
         String::from_utf8_lossy(&echo)
     );
 
-    assert_eq!(echo, msg);
+    assert_eq!(&echo[..], msg);
     info!("Echo verified!");
 
     Ok(())

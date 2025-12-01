@@ -6,11 +6,11 @@ pub mod record;
 mod tests;
 
 use aes_gcm::{
-    Aes128Gcm, Nonce,
+    Aes128Gcm, Nonce, Tag,
     aead::{Aead, AeadInPlace, KeyInit, Payload},
 };
 use anyhow::Result;
-use bytes::{Buf, Bytes, BytesMut};
+use bytes::{Buf, BufMut, Bytes, BytesMut};
 use core::fmt;
 use hmac::{Hmac, Mac};
 use p256::ecdsa::signature::Verifier;
@@ -21,7 +21,8 @@ use rand_core::OsRng;
 use rcgen::generate_simple_self_signed;
 use sha2::{Digest, Sha256};
 use std::sync::Arc;
-use tokio::sync::{Mutex, mpsc};
+use std::sync::atomic::{AtomicU16, AtomicU64, Ordering};
+use tokio::sync::{RwLock, mpsc};
 
 use self::handshake::{
     CertificateMessage, ClientHello, ClientKeyExchange, Finished, HandshakeMessage, HandshakeType,
@@ -33,9 +34,13 @@ use tracing::{debug, trace, warn};
 
 pub fn generate_certificate() -> Result<Certificate> {
     let cert = generate_simple_self_signed(vec!["localhost".to_string()])?;
+    let pem = cert.signing_key.serialize_pem();
+    let signing_key = SigningKey::from_pkcs8_pem(&pem).ok().map(Arc::new);
+
     Ok(Certificate {
         certificate: vec![cert.cert.der().to_vec()],
-        private_key: cert.signing_key.serialize_pem(),
+        private_key: pem,
+        dtls_signing_key: signing_key,
     })
 }
 
@@ -54,6 +59,7 @@ pub fn fingerprint(cert: &Certificate) -> String {
 pub struct Certificate {
     pub certificate: Vec<Vec<u8>>,
     pub private_key: String, // PEM encoded key
+    pub(crate) dtls_signing_key: Option<Arc<SigningKey>>,
 }
 
 #[derive(Clone, PartialEq)]
@@ -69,12 +75,13 @@ pub struct SessionKeys {
 
 struct DtlsInner {
     conn: Arc<IceConn>,
-    state: Arc<Mutex<DtlsState>>,
+    state: Arc<RwLock<DtlsState>>,
     state_tx: tokio::sync::watch::Sender<DtlsState>,
     state_rx: tokio::sync::watch::Receiver<DtlsState>,
-    incoming_data_rx: Arc<Mutex<mpsc::Receiver<Vec<u8>>>>,
-    outgoing_data_tx: mpsc::Sender<Bytes>,
-    handshake_rx_feeder: mpsc::Sender<Vec<u8>>,
+    handshake_rx_feeder: mpsc::Sender<Bytes>,
+    write_seq: AtomicU64,
+    write_epoch: AtomicU16,
+    is_client: bool,
 }
 
 pub struct DtlsTransport {
@@ -82,11 +89,24 @@ pub struct DtlsTransport {
     close_tx: Arc<tokio::sync::Notify>,
 }
 
+#[derive(Clone)]
+pub struct SessionCrypto {
+    pub keys: SessionKeys,
+    pub client_write_cipher: Aes128Gcm,
+    pub server_write_cipher: Aes128Gcm,
+}
+
+impl PartialEq for SessionCrypto {
+    fn eq(&self, other: &Self) -> bool {
+        self.keys == other.keys
+    }
+}
+
 #[derive(Clone, PartialEq)]
 pub enum DtlsState {
     New,
     Handshaking,
-    Connected(SessionKeys, Option<u16>),
+    Connected(Arc<SessionCrypto>, Option<u16>),
     Failed,
     Closed,
 }
@@ -105,27 +125,32 @@ impl fmt::Display for DtlsState {
 
 impl DtlsTransport {
     pub async fn get_state(&self) -> DtlsState {
-        self.inner.state.lock().await.clone()
+        self.inner.state.read().await.clone()
     }
 
     pub async fn new(
         conn: Arc<IceConn>,
         certificate: Certificate,
         is_client: bool,
-    ) -> Result<(Arc<Self>, impl std::future::Future<Output = ()> + Send)> {
-        let (incoming_data_tx, incoming_data_rx) = mpsc::channel(100);
-        let (outgoing_data_tx, outgoing_data_rx) = mpsc::channel(100);
-        let (handshake_rx_feeder, handshake_rx) = mpsc::channel(100);
+        buffer_size: usize,
+    ) -> Result<(
+        Arc<Self>,
+        mpsc::Receiver<Bytes>,
+        impl std::future::Future<Output = ()> + Send,
+    )> {
+        let (incoming_data_tx, incoming_data_rx) = mpsc::channel(buffer_size);
+        let (handshake_rx_feeder, handshake_rx) = mpsc::channel(2000);
         let (state_tx, state_rx) = tokio::sync::watch::channel(DtlsState::New);
 
         let inner = Arc::new(DtlsInner {
             conn: conn.clone(),
-            state: Arc::new(Mutex::new(DtlsState::New)),
+            state: Arc::new(RwLock::new(DtlsState::New)),
             state_tx,
             state_rx,
-            incoming_data_rx: Arc::new(Mutex::new(incoming_data_rx)),
-            outgoing_data_tx,
             handshake_rx_feeder,
+            write_seq: AtomicU64::new(0),
+            write_epoch: AtomicU16::new(0),
+            is_client,
         });
 
         let close_tx = Arc::new(tokio::sync::Notify::new());
@@ -146,20 +171,19 @@ impl DtlsTransport {
                     certificate,
                     is_client,
                     incoming_data_tx,
-                    outgoing_data_rx,
                     handshake_rx,
                     close_rx,
                 )
                 .await
             {
                 warn!("DTLS handshake failed: {}", e);
-                *inner_clone.state.lock().await = DtlsState::Failed;
+                *inner_clone.state.write().await = DtlsState::Failed;
                 let _ = inner_clone.state_tx.send(DtlsState::Failed);
             }
             // Connected state is set inside handshake now
         };
 
-        Ok((transport, runner))
+        Ok((transport, incoming_data_rx, runner))
     }
 
     pub fn subscribe_state(&self) -> tokio::sync::watch::Receiver<DtlsState> {
@@ -171,23 +195,93 @@ impl DtlsTransport {
     }
 
     pub async fn send(&self, data: Bytes) -> Result<()> {
-        self.inner
-            .outgoing_data_tx
-            .send(data)
-            .await
-            .map_err(|_| anyhow::anyhow!("Send failed"))
-    }
+        let crypto = {
+            let state_guard = self.inner.state.read().await;
+            if let DtlsState::Connected(crypto, _) = &*state_guard {
+                crypto.clone()
+            } else {
+                return Err(anyhow::anyhow!("DTLS not connected"));
+            }
+        };
 
-    pub async fn recv(&self) -> Result<Vec<u8>> {
-        let mut rx = self.inner.incoming_data_rx.lock().await;
-        rx.recv().await.ok_or(anyhow::anyhow!("Channel closed"))
+        let (cipher, iv) = if self.inner.is_client {
+            (&crypto.client_write_cipher, &crypto.keys.client_write_iv)
+        } else {
+            (&crypto.server_write_cipher, &crypto.keys.server_write_iv)
+        };
+
+        let epoch = self.inner.write_epoch.load(Ordering::SeqCst);
+        let seq = self.inner.write_seq.fetch_add(1, Ordering::SeqCst);
+        let full_seq = ((epoch as u64) << 48) | seq;
+
+        // Pre-calculate sizes
+        let header_len = 13;
+        let explicit_nonce_len = 8;
+        let tag_len = 16;
+        let total_len = header_len + explicit_nonce_len + data.len() + tag_len;
+
+        let mut buf = BytesMut::with_capacity(total_len);
+
+        // 1. Header
+        buf.put_u8(ContentType::ApplicationData as u8);
+        buf.put_u8(ProtocolVersion::DTLS_1_2.major);
+        buf.put_u8(ProtocolVersion::DTLS_1_2.minor);
+        buf.put_u16(epoch);
+        buf.put_uint(seq, 6);
+        let ciphertext_len = explicit_nonce_len + data.len() + tag_len;
+        buf.put_u16(ciphertext_len as u16);
+
+        // 2. Explicit Nonce (full_seq)
+        buf.put_u64(full_seq);
+
+        // 3. Payload
+        buf.put_slice(&data);
+
+        // 4. Encrypt in place
+        let payload_offset = header_len + explicit_nonce_len;
+        let payload_len = data.len();
+
+        let mut nonce_bytes = [0u8; 12];
+        nonce_bytes[0..4].copy_from_slice(iv);
+        nonce_bytes[4..12].copy_from_slice(&full_seq.to_be_bytes());
+        let nonce = Nonce::from_slice(&nonce_bytes);
+
+        // AAD
+        let mut aad = [0u8; 13];
+        aad[0..8].copy_from_slice(&full_seq.to_be_bytes());
+        aad[8] = ContentType::ApplicationData as u8;
+        aad[9] = ProtocolVersion::DTLS_1_2.major;
+        aad[10] = ProtocolVersion::DTLS_1_2.minor;
+        aad[11..13].copy_from_slice(&(data.len() as u16).to_be_bytes());
+
+        let tag = cipher
+            .encrypt_in_place_detached(
+                nonce,
+                &aad,
+                &mut buf[payload_offset..payload_offset + payload_len],
+            )
+            .map_err(|e| anyhow::anyhow!("Encryption failed: {}", e))?;
+
+        // 5. Append Tag
+        buf.put_slice(&tag);
+
+        self.inner
+            .conn
+            .send(&buf)
+            .await
+            .map(|_| ())
+            .map_err(|e| anyhow::anyhow!("Send failed: {}", e))
     }
 
     pub async fn export_keying_material(&self, label: &str, len: usize) -> Result<Vec<u8>> {
-        let state = self.inner.state.lock().await;
-        if let DtlsState::Connected(keys, _) = &*state {
-            let seed = [keys.client_random.as_slice(), keys.server_random.as_slice()].concat();
-            prf_sha256(&keys.master_secret, label.as_bytes(), &seed, len)
+        let state = self.inner.state.read().await;
+        if let DtlsState::Connected(crypto, _) = &*state {
+            let seed = [
+                crypto.keys.client_random.as_slice(),
+                crypto.keys.server_random.as_slice(),
+            ]
+            .concat();
+            prf_sha256(&crypto.keys.master_secret, label.as_bytes(), &seed, len)
         } else {
             Err(anyhow::anyhow!("DTLS not connected"))
         }
@@ -213,13 +307,13 @@ impl DtlsInner {
 
     async fn handle_incoming_packet(
         &self,
-        packet: Vec<u8>,
+        packet: Bytes,
         ctx: &mut HandshakeContext,
-        incoming_data_tx: &mpsc::Sender<Vec<u8>>,
+        incoming_data_tx: &mpsc::Sender<Bytes>,
         certificate: &Certificate,
         is_client: bool,
     ) -> Result<()> {
-        let mut data = Bytes::from(packet);
+        let mut data = packet;
 
         while !data.is_empty() {
             match DtlsRecord::decode(&mut data) {
@@ -262,15 +356,43 @@ impl DtlsInner {
             return Ok(record.payload.clone());
         }
 
-        if let Some(keys) = &ctx.session_keys {
+        // Sequence number for AAD is epoch (16) + seq (48)
+        let full_seq = ((record.epoch as u64) << 48) | record.sequence_number;
+
+        if let Some(crypto) = &ctx.session_crypto {
+            let (cipher, iv) = if is_client {
+                (&crypto.server_write_cipher, &crypto.keys.server_write_iv)
+            } else {
+                (&crypto.client_write_cipher, &crypto.keys.client_write_iv)
+            };
+
+            match decrypt_record_with_cipher(
+                record.content_type,
+                record.version,
+                full_seq,
+                &record.payload,
+                cipher,
+                iv,
+            ) {
+                Ok(p) => Ok(p),
+                Err(e) => {
+                    debug!(
+                        "Decryption failed details: seq={} epoch={} type={:?} ver={:?} len={}",
+                        record.sequence_number,
+                        record.epoch,
+                        record.content_type,
+                        record.version,
+                        record.payload.len()
+                    );
+                    Err(anyhow::anyhow!("Decryption failed: {}", e))
+                }
+            }
+        } else if let Some(keys) = &ctx.session_keys {
             let (key, iv) = if is_client {
                 (&keys.server_write_key, &keys.server_write_iv)
             } else {
                 (&keys.client_write_key, &keys.client_write_iv)
             };
-
-            // Sequence number for AAD is epoch (16) + seq (48)
-            let full_seq = ((record.epoch as u64) << 48) | record.sequence_number;
 
             match decrypt_record(
                 record.content_type,
@@ -305,7 +427,7 @@ impl DtlsInner {
         content_type: ContentType,
         payload: Bytes,
         ctx: &mut HandshakeContext,
-        incoming_data_tx: &mpsc::Sender<Vec<u8>>,
+        incoming_data_tx: &mpsc::Sender<Bytes>,
         certificate: &Certificate,
         is_client: bool,
     ) -> Result<()> {
@@ -315,7 +437,7 @@ impl DtlsInner {
                 // TODO: Switch to encrypted mode
             }
             ContentType::ApplicationData => {
-                if let Err(e) = incoming_data_tx.send(payload.to_vec()).await {
+                if let Err(e) = incoming_data_tx.send(payload).await {
                     warn!("Failed to send incoming data to channel: {}", e);
                 }
             }
@@ -329,7 +451,7 @@ impl DtlsInner {
                     let description = payload[1];
                     if description == 0 {
                         // CloseNotify
-                        *self.state.lock().await = DtlsState::Closed;
+                        *self.state.write().await = DtlsState::Closed;
                         let _ = self.state_tx.send(DtlsState::Closed);
                     }
                 }
@@ -621,8 +743,14 @@ impl DtlsInner {
         params.push(ctx.local_public_key_bytes.len() as u8);
         params.extend_from_slice(&ctx.local_public_key_bytes);
 
-        let signing_key = SigningKey::from_pkcs8_pem(&certificate.private_key)
-            .map_err(|e| anyhow::anyhow!("Failed to parse private key: {}", e))?;
+        let signing_key = if let Some(k) = &certificate.dtls_signing_key {
+            k.clone()
+        } else {
+            Arc::new(
+                SigningKey::from_pkcs8_pem(&certificate.private_key)
+                    .map_err(|e| anyhow::anyhow!("Failed to parse private key: {}", e))?,
+            )
+        };
         let signature: p256::ecdsa::Signature = signing_key.sign_with_rng(&mut OsRng, &params);
         let signature_bytes = signature.to_der().as_bytes().to_vec();
         // Self-verification
@@ -789,6 +917,7 @@ impl DtlsInner {
         };
 
         trace!("Session keys derived (Server)");
+        ctx.session_crypto = Some(create_session_crypto(keys.clone())?);
         ctx.session_keys = Some(keys);
 
         Ok(())
@@ -824,7 +953,7 @@ impl DtlsInner {
                         "Finished verification failed. Expected {:?}, got {:?}",
                         expected_verify_data, finished.verify_data
                     );
-                    *self.state.lock().await = DtlsState::Failed;
+                    *self.state.write().await = DtlsState::Failed;
                     return Err(anyhow::anyhow!("Finished verification failed"));
                 } else {
                     trace!("Client Finished verified");
@@ -890,13 +1019,16 @@ impl DtlsInner {
             // message_seq += 1; // End of handshake
 
             if let Some(keys) = &ctx.session_keys {
-                let state = DtlsState::Connected(keys.clone(), ctx.srtp_profile);
-                *self.state.lock().await = state.clone();
+                let crypto = create_session_crypto(keys.clone())?;
+                let state = DtlsState::Connected(Arc::new(crypto), ctx.srtp_profile);
+                *self.state.write().await = state.clone();
+                self.write_epoch.store(ctx.epoch, Ordering::SeqCst);
+                self.write_seq.store(ctx.sequence_number, Ordering::SeqCst);
                 let _ = self.state_tx.send(state);
                 // Clear ephemeral secret as handshake is complete
                 ctx.local_secret = None;
             } else {
-                *self.state.lock().await = DtlsState::Failed;
+                *self.state.write().await = DtlsState::Failed;
                 let _ = self.state_tx.send(DtlsState::Failed);
                 return Err(anyhow::anyhow!("Session keys not derived"));
             }
@@ -914,13 +1046,16 @@ impl DtlsInner {
                         "Finished verification failed. Expected {:?}, got {:?}",
                         expected_verify_data, finished.verify_data
                     );
-                    *self.state.lock().await = DtlsState::Failed;
+                    *self.state.write().await = DtlsState::Failed;
                     return Err(anyhow::anyhow!("Finished verification failed"));
                 } else {
                     debug!("Finished verified");
                     if let Some(keys) = &ctx.session_keys {
-                        let state = DtlsState::Connected(keys.clone(), ctx.srtp_profile);
-                        *self.state.lock().await = state.clone();
+                        let crypto = create_session_crypto(keys.clone())?;
+                        let state = DtlsState::Connected(Arc::new(crypto), ctx.srtp_profile);
+                        *self.state.write().await = state.clone();
+                        self.write_epoch.store(ctx.epoch, Ordering::SeqCst);
+                        self.write_seq.store(ctx.sequence_number, Ordering::SeqCst);
                         let _ = self.state_tx.send(state);
                         ctx.local_secret = None;
                     }
@@ -1163,6 +1298,7 @@ impl DtlsInner {
             Ok(k) => k,
             Err(_) => return Ok(()),
         };
+        ctx.session_crypto = Some(create_session_crypto(keys.clone())?);
         ctx.session_keys = Some(keys);
 
         // Send ChangeCipherSpec
@@ -1218,18 +1354,20 @@ impl DtlsInner {
         &self,
         certificate: Certificate,
         is_client: bool,
-        incoming_data_tx: mpsc::Sender<Vec<u8>>,
-        mut outgoing_data_rx: mpsc::Receiver<Bytes>,
-        mut handshake_rx: mpsc::Receiver<Vec<u8>>,
+        incoming_data_tx: mpsc::Sender<Bytes>,
+        mut handshake_rx: mpsc::Receiver<Bytes>,
         close_rx: Arc<tokio::sync::Notify>,
     ) -> Result<()> {
-        *self.state.lock().await = DtlsState::Handshaking;
+        *self.state.write().await = DtlsState::Handshaking;
         let _ = self.state_tx.send(DtlsState::Handshaking);
 
         let mut ctx = HandshakeContext::new();
 
         // Retransmission state
-        let mut retransmit_interval = tokio::time::interval(std::time::Duration::from_secs(1));
+        let mut retransmit_interval = tokio::time::interval_at(
+            tokio::time::Instant::now() + std::time::Duration::from_secs(1),
+            std::time::Duration::from_secs(1),
+        );
         retransmit_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
         if is_client {
@@ -1333,46 +1471,6 @@ impl DtlsInner {
                 Some(packet) = handshake_rx.recv() => {
                     self.handle_incoming_packet(packet, &mut ctx, &incoming_data_tx, &certificate, is_client).await?;
                 }
-                Some(data) = outgoing_data_rx.recv() => {
-                    if let Some(keys) = &ctx.session_keys {
-                        let (key, iv) = if is_client {
-                            (&keys.client_write_key, &keys.client_write_iv)
-                        } else {
-                            (&keys.server_write_key, &keys.server_write_iv)
-                        };
-
-                        let full_seq = ((ctx.epoch as u64) << 48) | ctx.sequence_number;
-
-                        match encrypt_record(
-                            ContentType::ApplicationData,
-                            ProtocolVersion::DTLS_1_2,
-                            full_seq,
-                            &data,
-                            key,
-                            iv
-                        ) {
-                            Ok(encrypted) => {
-                                let record = DtlsRecord {
-                                    content_type: ContentType::ApplicationData,
-                                    version: ProtocolVersion::DTLS_1_2,
-                                    epoch: ctx.epoch,
-                                    sequence_number: ctx.sequence_number,
-                                    payload: Bytes::from(encrypted),
-                                };
-                                ctx.sequence_number += 1;
-
-                                let mut buf = BytesMut::new();
-                                record.encode(&mut buf);
-                                if let Err(e) = self.conn.send(&buf).await {
-                                     warn!("Failed to send application data: {}", e);
-                                }
-                            },
-                            Err(e) => warn!("Failed to encrypt application data: {}", e),
-                        }
-                    } else {
-                        warn!("Cannot send application data: handshake not completed");
-                    }
-                }
             }
         }
     }
@@ -1448,7 +1546,7 @@ impl PacketReceiver for DtlsTransport {
     async fn receive(&self, packet: Bytes, _addr: SocketAddr) {
         // Push to the internal handshake loop
         // We ignore errors here (e.g. if the loop is closed)
-        let _ = self.inner.handshake_rx_feeder.send(packet.to_vec()).await;
+        let _ = self.inner.handshake_rx_feeder.send(packet).await;
     }
 }
 
@@ -1509,6 +1607,18 @@ fn expand_keys(
     Ok(keys)
 }
 
+fn create_session_crypto(keys: SessionKeys) -> Result<SessionCrypto> {
+    let client_write_cipher = Aes128Gcm::new_from_slice(&keys.client_write_key)
+        .map_err(|_| anyhow::anyhow!("Invalid key length"))?;
+    let server_write_cipher = Aes128Gcm::new_from_slice(&keys.server_write_key)
+        .map_err(|_| anyhow::anyhow!("Invalid key length"))?;
+    Ok(SessionCrypto {
+        keys,
+        client_write_cipher,
+        server_write_cipher,
+    })
+}
+
 fn calculate_verify_data(
     master_secret: &[u8],
     label: &[u8],
@@ -1526,14 +1636,50 @@ fn make_aad(
     content_type: ContentType,
     version: ProtocolVersion,
     length: usize,
-) -> Vec<u8> {
-    let mut aad = Vec::with_capacity(13);
-    aad.extend_from_slice(&seq.to_be_bytes());
-    aad.push(content_type as u8);
-    aad.push(version.major);
-    aad.push(version.minor);
-    aad.extend_from_slice(&(length as u16).to_be_bytes());
+) -> [u8; 13] {
+    let mut aad = [0u8; 13];
+    aad[0..8].copy_from_slice(&seq.to_be_bytes());
+    aad[8] = content_type as u8;
+    aad[9] = version.major;
+    aad[10] = version.minor;
+    aad[11..13].copy_from_slice(&(length as u16).to_be_bytes());
     aad
+}
+
+fn decrypt_record_with_cipher(
+    content_type: ContentType,
+    version: ProtocolVersion,
+    seq: u64,
+    payload: &Bytes,
+    cipher: &Aes128Gcm,
+    iv: &[u8],
+) -> Result<Bytes> {
+    if payload.len() < 8 + 16 {
+        return Err(anyhow::anyhow!("Record too short"));
+    }
+
+    let explicit_nonce = &payload[0..8];
+    let ciphertext_len = payload.len() - 8 - 16;
+    let ciphertext = &payload[8..8 + ciphertext_len];
+    let tag_bytes = &payload[8 + ciphertext_len..];
+
+    let mut nonce_bytes = [0u8; 12];
+    nonce_bytes[0..4].copy_from_slice(iv);
+    nonce_bytes[4..12].copy_from_slice(explicit_nonce);
+
+    let nonce = Nonce::from_slice(&nonce_bytes);
+    let tag = Tag::from_slice(tag_bytes);
+
+    let aad = make_aad(seq, content_type, version, ciphertext_len);
+
+    let mut buf = BytesMut::with_capacity(ciphertext_len);
+    buf.put_slice(ciphertext);
+
+    cipher
+        .decrypt_in_place_detached(nonce, &aad, &mut buf, tag)
+        .map_err(|e| anyhow::anyhow!("Decryption failed: {}", e))?;
+
+    Ok(buf.freeze())
 }
 
 fn decrypt_record(
@@ -1622,6 +1768,7 @@ struct HandshakeContext {
     client_random: Option<Vec<u8>>,
     server_random: Option<Vec<u8>>,
     session_keys: Option<SessionKeys>,
+    session_crypto: Option<SessionCrypto>,
     handshake_messages: Vec<u8>,
     ems_negotiated: bool,
     srtp_profile: Option<u16>,
@@ -1646,6 +1793,7 @@ impl HandshakeContext {
             client_random: None,
             server_random: None,
             session_keys: None,
+            session_crypto: None,
             handshake_messages: Vec::new(),
             ems_negotiated: false,
             srtp_profile: None,

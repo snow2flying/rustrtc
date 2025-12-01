@@ -1,7 +1,8 @@
-use crate::transports::dtls::DtlsTransport;
+use crate::transports::dtls::{DtlsState, DtlsTransport};
 use crate::transports::ice::stun::random_u32;
 use anyhow::Result;
 use bytes::{Buf, BufMut, Bytes, BytesMut};
+use std::sync::atomic::{AtomicU8, AtomicU16, AtomicU32, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, Weak};
 use tokio::sync::{Mutex as TokioMutex, mpsc};
 use tracing::{debug, trace, warn};
@@ -115,7 +116,7 @@ pub enum SctpState {
 #[derive(Debug, Clone)]
 pub enum DataChannelEvent {
     Open,
-    Message(Vec<u8>),
+    Message(Bytes),
     Close,
 }
 
@@ -127,18 +128,31 @@ pub struct DataChannel {
     pub max_retransmits: Option<u16>,
     pub max_packet_life_time: Option<u16>,
     pub negotiated: bool,
-    pub state: Mutex<DataChannelState>,
-    pub next_ssn: Mutex<u16>,
+    pub state: AtomicUsize,
+    pub next_ssn: AtomicU16,
     tx: Mutex<Option<mpsc::UnboundedSender<DataChannelEvent>>>,
     rx: TokioMutex<mpsc::UnboundedReceiver<DataChannelEvent>>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(usize)]
 pub enum DataChannelState {
-    Connecting,
-    Open,
-    Closing,
-    Closed,
+    Connecting = 0,
+    Open = 1,
+    Closing = 2,
+    Closed = 3,
+}
+
+impl From<usize> for DataChannelState {
+    fn from(v: usize) -> Self {
+        match v {
+            0 => DataChannelState::Connecting,
+            1 => DataChannelState::Open,
+            2 => DataChannelState::Closing,
+            3 => DataChannelState::Closed,
+            _ => DataChannelState::Closed,
+        }
+    }
 }
 
 // SCTP Constants
@@ -169,10 +183,13 @@ struct SctpInner {
     data_channels: Arc<Mutex<Vec<Weak<DataChannel>>>>,
     local_port: u16,
     remote_port: u16,
-    verification_tag: Mutex<u32>,
-    remote_verification_tag: Mutex<u32>,
-    next_tsn: Mutex<u32>,
+    verification_tag: AtomicU32,
+    remote_verification_tag: AtomicU32,
+    next_tsn: AtomicU32,
+    cumulative_tsn_ack: AtomicU32,
     new_data_channel_tx: Option<mpsc::UnboundedSender<Arc<DataChannel>>>,
+    sack_counter: AtomicU8,
+    is_client: bool,
 }
 
 struct SctpCleanupGuard<'a> {
@@ -186,10 +203,10 @@ impl<'a> Drop for SctpCleanupGuard<'a> {
         let channels = self.inner.data_channels.lock().unwrap();
         for weak_dc in channels.iter() {
             if let Some(dc) = weak_dc.upgrade() {
-                let mut state = dc.state.lock().unwrap();
-                if *state != DataChannelState::Closed {
-                    *state = DataChannelState::Closed;
-                    drop(state);
+                let old_state = dc
+                    .state
+                    .swap(DataChannelState::Closed as usize, Ordering::SeqCst);
+                if old_state != DataChannelState::Closed as usize {
                     dc.send_event(DataChannelEvent::Close);
                     dc.close_channel();
                 }
@@ -206,10 +223,12 @@ pub struct SctpTransport {
 impl SctpTransport {
     pub fn new(
         dtls_transport: Arc<DtlsTransport>,
+        incoming_data_rx: mpsc::Receiver<Bytes>,
         data_channels: Arc<Mutex<Vec<Weak<DataChannel>>>>,
         local_port: u16,
         remote_port: u16,
         new_data_channel_tx: Option<mpsc::UnboundedSender<Arc<DataChannel>>>,
+        is_client: bool,
     ) -> (
         Arc<Self>,
         impl std::future::Future<Output = ()> + Send + 'static,
@@ -220,10 +239,13 @@ impl SctpTransport {
             data_channels,
             local_port,
             remote_port,
-            verification_tag: Mutex::new(0),
-            remote_verification_tag: Mutex::new(0),
-            next_tsn: Mutex::new(0),
+            verification_tag: AtomicU32::new(0),
+            remote_verification_tag: AtomicU32::new(0),
+            next_tsn: AtomicU32::new(0),
+            cumulative_tsn_ack: AtomicU32::new(0),
             new_data_channel_tx,
+            sack_counter: AtomicU8::new(0),
+            is_client,
         });
 
         let close_tx = Arc::new(tokio::sync::Notify::new());
@@ -236,7 +258,7 @@ impl SctpTransport {
 
         let inner_clone = inner.clone();
         let runner = async move {
-            inner_clone.run_loop(close_rx).await;
+            inner_clone.run_loop(close_rx, incoming_data_rx).await;
         };
 
         (transport, runner)
@@ -266,7 +288,8 @@ impl SctpTransport {
         } else {
             let state = *self.inner.state.lock().unwrap();
             if state == SctpState::Connected {
-                *dc.state.lock().unwrap() = DataChannelState::Open;
+                dc.state
+                    .store(DataChannelState::Open as usize, Ordering::SeqCst);
                 dc.send_event(DataChannelEvent::Open);
             }
         }
@@ -294,24 +317,50 @@ impl Drop for SctpTransport {
 }
 
 impl SctpInner {
-    async fn run_loop(&self, close_rx: Arc<tokio::sync::Notify>) {
+    async fn run_loop(
+        &self,
+        close_rx: Arc<tokio::sync::Notify>,
+        mut incoming_data_rx: mpsc::Receiver<Bytes>,
+    ) {
         *self.state.lock().unwrap() = SctpState::Connecting;
 
         // Guard to ensure cleanup happens on drop (cancellation)
         let _guard = SctpCleanupGuard { inner: self };
 
+        // Wait for DTLS to be connected
+        let mut dtls_state_rx = self.dtls_transport.subscribe_state();
+        loop {
+            let state = dtls_state_rx.borrow_and_update().clone();
+            if let DtlsState::Connected(_, _) = state {
+                break;
+            }
+            if let DtlsState::Failed | DtlsState::Closed = state {
+                warn!("DTLS failed or closed before SCTP start");
+                return;
+            }
+            if dtls_state_rx.changed().await.is_err() {
+                return;
+            }
+        }
+
+        if self.is_client {
+            if let Err(e) = self.send_init().await {
+                warn!("Failed to send SCTP INIT: {}", e);
+            }
+        }
+
         loop {
             tokio::select! {
                 _ = close_rx.notified() => break,
-                res = self.dtls_transport.recv() => {
+                res = incoming_data_rx.recv() => {
                     match res {
-                        Ok(packet) => {
-                            if let Err(e) = self.handle_packet(&packet).await {
+                        Some(packet) => {
+                            if let Err(e) = self.handle_packet(packet).await {
                                 warn!("SCTP handle packet error: {}", e);
                             }
                         }
-                        Err(e) => {
-                            warn!("SCTP loop error: {}", e);
+                        None => {
+                            warn!("SCTP loop error: Channel closed");
                             break;
                         }
                     }
@@ -320,12 +369,40 @@ impl SctpInner {
         }
     }
 
-    async fn handle_packet(&self, packet: &[u8]) -> Result<()> {
+    async fn send_init(&self) -> Result<()> {
+        let local_tag = random_u32();
+        self.verification_tag.store(local_tag, Ordering::SeqCst);
+
+        let initial_tsn = random_u32();
+        self.next_tsn.store(initial_tsn, Ordering::SeqCst);
+
+        let mut init_params = BytesMut::new();
+        // Initiate Tag
+        init_params.put_u32(local_tag);
+        // a_rwnd
+        init_params.put_u32(128 * 1024);
+        // Outbound streams
+        init_params.put_u16(10);
+        // Inbound streams
+        init_params.put_u16(10);
+        // Initial TSN
+        init_params.put_u32(initial_tsn);
+
+        // Optional: Supported Address Types (IPv4)
+        init_params.put_u16(12); // Type 12
+        init_params.put_u16(6); // Length 6
+        init_params.put_u16(5); // IPv4
+        init_params.put_u16(0); // Padding
+
+        self.send_chunk(CT_INIT, 0, init_params.freeze(), 0).await
+    }
+
+    async fn handle_packet(&self, packet: Bytes) -> Result<()> {
         if packet.len() < SCTP_COMMON_HEADER_SIZE {
             return Ok(());
         }
 
-        let mut buf = Bytes::copy_from_slice(packet);
+        let mut buf = packet;
         let _src_port = buf.get_u16();
         let _dst_port = buf.get_u16();
         let verification_tag = buf.get_u32();
@@ -340,6 +417,8 @@ impl SctpInner {
             let chunk_type = buf.get_u8();
             let chunk_flags = buf.get_u8();
             let chunk_length = buf.get_u16() as usize;
+
+            // println!("SCTP Chunk: type={} len={}", chunk_type, chunk_length);
 
             if chunk_length < CHUNK_HEADER_SIZE
                 || buf.remaining() < chunk_length - CHUNK_HEADER_SIZE
@@ -357,8 +436,11 @@ impl SctpInner {
 
             match chunk_type {
                 CT_INIT => self.handle_init(verification_tag, chunk_value).await?,
+                CT_INIT_ACK => self.handle_init_ack(chunk_value).await?,
                 CT_COOKIE_ECHO => self.handle_cookie_echo(chunk_value).await?,
+                CT_COOKIE_ACK => self.handle_cookie_ack(chunk_value).await?,
                 CT_DATA => self.handle_data(chunk_flags, chunk_value).await?,
+                CT_SACK => self.handle_sack(chunk_value).await?,
                 CT_HEARTBEAT => self.handle_heartbeat(chunk_value).await?,
                 _ => {
                     trace!("Unhandled SCTP chunk type: {}", chunk_type);
@@ -378,13 +460,16 @@ impl SctpInner {
         let _a_rwnd = buf.get_u32();
         let _outbound_streams = buf.get_u16();
         let _inbound_streams = buf.get_u16();
-        let _initial_tsn = buf.get_u32();
+        let initial_tsn = buf.get_u32();
 
-        *self.remote_verification_tag.lock().unwrap() = initiate_tag;
+        self.remote_verification_tag
+            .store(initiate_tag, Ordering::SeqCst);
+        self.cumulative_tsn_ack
+            .store(initial_tsn.wrapping_sub(1), Ordering::SeqCst);
 
         // Generate local tag
         let local_tag = random_u32();
-        *self.verification_tag.lock().unwrap() = local_tag;
+        self.verification_tag.store(local_tag, Ordering::SeqCst);
 
         // Send INIT ACK
         // We need to construct a cookie. For simplicity, we'll just echo back some dummy data.
@@ -401,7 +486,7 @@ impl SctpInner {
         init_ack_params.put_u16(10);
         // Initial TSN
         let initial_tsn = random_u32();
-        *self.next_tsn.lock().unwrap() = initial_tsn;
+        self.next_tsn.store(initial_tsn, Ordering::SeqCst);
         init_ack_params.put_u32(initial_tsn);
 
         // State Cookie Parameter (Type 7)
@@ -419,9 +504,96 @@ impl SctpInner {
         Ok(())
     }
 
+    async fn handle_init_ack(&self, chunk: Bytes) -> Result<()> {
+        let mut buf = chunk;
+        if buf.remaining() < 16 {
+            return Ok(());
+        }
+        let initiate_tag = buf.get_u32();
+        let _a_rwnd = buf.get_u32();
+        let _outbound_streams = buf.get_u16();
+        let _inbound_streams = buf.get_u16();
+        let initial_tsn = buf.get_u32();
+
+        self.remote_verification_tag
+            .store(initiate_tag, Ordering::SeqCst);
+        self.cumulative_tsn_ack
+            .store(initial_tsn.wrapping_sub(1), Ordering::SeqCst);
+
+        // Parse parameters to find Cookie
+        let mut cookie = None;
+        while buf.remaining() >= 4 {
+            let param_type = buf.get_u16();
+            let param_len = buf.get_u16() as usize;
+            if param_len < 4 || buf.remaining() < param_len - 4 {
+                break;
+            }
+            let param_value = buf.split_to(param_len - 4);
+
+            // Padding
+            let padding = (4 - (param_len % 4)) % 4;
+            if buf.remaining() >= padding {
+                buf.advance(padding);
+            }
+
+            if param_type == 7 {
+                // State Cookie
+                cookie = Some(param_value);
+            }
+        }
+
+        if let Some(cookie_bytes) = cookie {
+            let tag = self.remote_verification_tag.load(Ordering::SeqCst);
+            self.send_chunk(CT_COOKIE_ECHO, 0, cookie_bytes, tag)
+                .await?;
+        }
+
+        Ok(())
+    }
+
+    async fn handle_cookie_ack(&self, _chunk: Bytes) -> Result<()> {
+        *self.state.lock().unwrap() = SctpState::Connected;
+
+        let channels_to_process = {
+            let mut channels = self.data_channels.lock().unwrap();
+            let mut to_process = Vec::new();
+            channels.retain(|weak_dc| {
+                if let Some(dc) = weak_dc.upgrade() {
+                    to_process.push(dc);
+                    true
+                } else {
+                    false
+                }
+            });
+            to_process
+        };
+
+        for dc in channels_to_process {
+            if dc.negotiated {
+                dc.state
+                    .store(DataChannelState::Open as usize, Ordering::SeqCst);
+                dc.send_event(DataChannelEvent::Open);
+            } else {
+                let state = dc.state.load(Ordering::SeqCst);
+                if state == DataChannelState::Connecting as usize {
+                    if let Err(e) = self.send_dcep_open(&dc).await {
+                        warn!("Failed to send DCEP OPEN: {}", e);
+                    }
+                }
+            }
+        }
+
+        Ok(())
+    }
+
+    async fn handle_sack(&self, _chunk: Bytes) -> Result<()> {
+        // TODO: Handle SACK for retransmission
+        Ok(())
+    }
+
     async fn handle_cookie_echo(&self, _chunk: Bytes) -> Result<()> {
         // Send COOKIE ACK
-        let tag = *self.remote_verification_tag.lock().unwrap();
+        let tag = self.remote_verification_tag.load(Ordering::SeqCst);
         self.send_chunk(CT_COOKIE_ACK, 0, Bytes::new(), tag).await?;
 
         *self.state.lock().unwrap() = SctpState::Connected;
@@ -442,11 +614,12 @@ impl SctpInner {
 
         for dc in channels_to_process {
             if dc.negotiated {
-                *dc.state.lock().unwrap() = DataChannelState::Open;
+                dc.state
+                    .store(DataChannelState::Open as usize, Ordering::SeqCst);
                 dc.send_event(DataChannelEvent::Open);
             } else {
-                let state = *dc.state.lock().unwrap();
-                if state == DataChannelState::Connecting {
+                let state = dc.state.load(Ordering::SeqCst);
+                if state == DataChannelState::Connecting as usize {
                     if let Err(e) = self.send_dcep_open(&dc).await {
                         warn!("Failed to send DCEP OPEN: {}", e);
                     }
@@ -461,7 +634,7 @@ impl SctpInner {
         // Send HEARTBEAT ACK with same info
         // ...
 
-        let tag = *self.remote_verification_tag.lock().unwrap();
+        let tag = self.remote_verification_tag.load(Ordering::SeqCst);
         self.send_chunk(CT_HEARTBEAT_ACK, 0, chunk, tag).await?;
         Ok(())
     }
@@ -478,36 +651,50 @@ impl SctpInner {
 
         let user_data = buf;
 
-        // Send SACK (Simplified: just ack this TSN)
-        let mut sack = BytesMut::new();
-        sack.put_u32(tsn); // Cumulative TSN Ack
-        sack.put_u32(1024 * 1024); // a_rwnd
-        sack.put_u16(0); // Number of Gap Ack Blocks
-        sack.put_u16(0); // Number of Duplicate TSNs
+        // Deduplication and Ordering Check
+        let cumulative_ack = self.cumulative_tsn_ack.load(Ordering::SeqCst);
+        let diff = tsn.wrapping_sub(cumulative_ack);
 
-        let tag = *self.remote_verification_tag.lock().unwrap();
-        self.send_chunk(CT_SACK, 0, sack.freeze(), tag).await?;
+        let should_drop = if diff == 0 || diff > 0x80000000 {
+            // Duplicate or Old
+            true
+        } else if diff == 1 {
+            // Next in sequence
+            self.cumulative_tsn_ack.store(tsn, Ordering::SeqCst);
+            false
+        } else {
+            // Gap
+            true
+        };
+
+        if should_drop {
+            let ack = self.cumulative_tsn_ack.load(Ordering::SeqCst);
+            self.send_sack(ack).await?;
+            return Ok(());
+        }
+
+        // Send SACK (Delayed Ack: every 2 packets)
+        let count = self.sack_counter.fetch_add(1, Ordering::Relaxed);
+        if count >= 1 {
+            self.sack_counter.store(0, Ordering::Relaxed);
+            let ack = self.cumulative_tsn_ack.load(Ordering::SeqCst);
+            self.send_sack(ack).await?;
+        }
 
         if payload_proto == DATA_CHANNEL_PPID_DCEP {
             self.handle_dcep(stream_id, user_data).await?;
             return Ok(());
         }
 
-        let mut channels = self.data_channels.lock().unwrap();
-        let mut found_dc = None;
-        channels.retain(|weak_dc| {
-            if let Some(dc) = weak_dc.upgrade() {
-                if dc.id == stream_id {
-                    found_dc = Some(dc);
-                }
-                true
-            } else {
-                false
-            }
-        });
+        let found_dc = {
+            let channels = self.data_channels.lock().unwrap();
+            channels
+                .iter()
+                .find_map(|weak_dc| weak_dc.upgrade().filter(|dc| dc.id == stream_id))
+        };
 
         if let Some(dc) = found_dc {
-            dc.send_event(DataChannelEvent::Message(user_data.to_vec()));
+            dc.send_event(DataChannelEvent::Message(user_data));
         }
 
         Ok(())
@@ -560,7 +747,8 @@ impl SctpInner {
                     };
 
                     let dc = Arc::new(DataChannel::new(stream_id, config));
-                    *dc.state.lock().unwrap() = DataChannelState::Open;
+                    dc.state
+                        .store(DataChannelState::Open as usize, Ordering::SeqCst);
 
                     {
                         let mut channels = self.data_channels.lock().unwrap();
@@ -586,9 +774,16 @@ impl SctpInner {
                 for weak_dc in channels.iter() {
                     if let Some(dc) = weak_dc.upgrade() {
                         if dc.id == stream_id {
-                            let mut state = dc.state.lock().unwrap();
-                            if *state == DataChannelState::Connecting {
-                                *state = DataChannelState::Open;
+                            if dc
+                                .state
+                                .compare_exchange(
+                                    DataChannelState::Connecting as usize,
+                                    DataChannelState::Open as usize,
+                                    Ordering::SeqCst,
+                                    Ordering::SeqCst,
+                                )
+                                .is_ok()
+                            {
                                 dc.send_event(DataChannelEvent::Open);
                             }
                             break;
@@ -603,6 +798,17 @@ impl SctpInner {
         Ok(())
     }
 
+    async fn send_sack(&self, cumulative_tsn_ack: u32) -> Result<()> {
+        let mut sack = BytesMut::new();
+        sack.put_u32(cumulative_tsn_ack); // Cumulative TSN Ack
+        sack.put_u32(1024 * 1024); // a_rwnd
+        sack.put_u16(0); // Number of Gap Ack Blocks
+        sack.put_u16(0); // Number of Duplicate TSNs
+
+        let tag = self.remote_verification_tag.load(Ordering::SeqCst);
+        self.send_chunk(CT_SACK, 0, sack.freeze(), tag).await
+    }
+
     async fn send_chunk(
         &self,
         type_: u8,
@@ -610,7 +816,11 @@ impl SctpInner {
         value: Bytes,
         verification_tag: u32,
     ) -> Result<()> {
-        let mut packet = BytesMut::new();
+        let value_len = value.len();
+        let padding = (4 - (value_len % 4)) % 4;
+        let total_len = SCTP_COMMON_HEADER_SIZE + CHUNK_HEADER_SIZE + value_len + padding;
+
+        let mut packet = BytesMut::with_capacity(total_len);
 
         // Common Header
         packet.put_u16(self.local_port);
@@ -621,11 +831,10 @@ impl SctpInner {
         // Chunk
         packet.put_u8(type_);
         packet.put_u8(flags);
-        packet.put_u16((CHUNK_HEADER_SIZE + value.len()) as u16);
+        packet.put_u16((CHUNK_HEADER_SIZE + value_len) as u16);
         packet.put_slice(&value);
 
         // Padding
-        let padding = (4 - (value.len() % 4)) % 4;
         for _ in 0..padding {
             packet.put_u8(0);
         }
@@ -658,48 +867,69 @@ impl SctpInner {
     }
 
     pub async fn send_data_raw(&self, channel_id: u16, ppid: u32, data: &[u8]) -> Result<()> {
-        // Wrap in DATA chunk
-        let mut payload = BytesMut::new();
+        // Calculate total size
+        // Common Header: 12
+        // Chunk Header: 4
+        // TSN: 4, StreamID: 2, StreamSeq: 2, PPID: 4 = 12
+        // Data: N
+        // Padding: 0-3
 
-        let tsn = {
-            let mut tsn_guard = self.next_tsn.lock().unwrap();
-            let tsn = *tsn_guard;
-            *tsn_guard = tsn.wrapping_add(1);
-            tsn
-        };
+        let data_len = data.len();
+        let chunk_value_len = 12 + data_len;
+        let chunk_len = 4 + chunk_value_len;
+        let padding = (4 - (chunk_len % 4)) % 4;
+        let total_len = 12 + chunk_len + padding;
+
+        let mut buf = BytesMut::with_capacity(total_len);
+
+        // Common Header
+        buf.put_u16(self.local_port);
+        buf.put_u16(self.remote_port);
+        let tag = self.remote_verification_tag.load(Ordering::SeqCst);
+        buf.put_u32(tag);
+        buf.put_u32(0); // Checksum placeholder (offset 8)
+
+        // Chunk Header (DATA)
+        buf.put_u8(CT_DATA);
+        buf.put_u8(0x03); // Flags: B|E
+        buf.put_u16(chunk_len as u16);
+
+        // DATA Chunk Value
+        let tsn = self.next_tsn.fetch_add(1, Ordering::SeqCst);
 
         let ssn = {
-            let mut channels = self.data_channels.lock().unwrap();
-            let mut found_dc = None;
-            channels.retain(|weak_dc| {
-                if let Some(dc) = weak_dc.upgrade() {
-                    if dc.id == channel_id {
-                        found_dc = Some(dc);
-                    }
-                    true
-                } else {
-                    false
-                }
-            });
+            let channels = self.data_channels.lock().unwrap();
+            let found_dc = channels
+                .iter()
+                .find_map(|weak_dc| weak_dc.upgrade().filter(|dc| dc.id == channel_id));
 
             if let Some(dc) = found_dc {
-                let mut ssn_guard = dc.next_ssn.lock().unwrap();
-                let ssn = *ssn_guard;
-                *ssn_guard = ssn.wrapping_add(1);
-                ssn
+                dc.next_ssn.fetch_add(1, Ordering::SeqCst)
             } else {
                 0
             }
         };
 
-        payload.put_u32(tsn); // TSN
-        payload.put_u16(channel_id); // Stream ID
-        payload.put_u16(ssn); // Stream Seq
-        payload.put_u32(ppid); // PPID
-        payload.put_slice(data);
+        buf.put_u32(tsn);
+        buf.put_u16(channel_id);
+        buf.put_u16(ssn);
+        buf.put_u32(ppid);
+        buf.put_slice(data);
 
-        let tag = *self.remote_verification_tag.lock().unwrap();
-        self.send_chunk(CT_DATA, 0x03, payload.freeze(), tag).await // 0x03 = B(egin) | E(nd)
+        // Padding
+        for _ in 0..padding {
+            buf.put_u8(0);
+        }
+
+        // CRC32c
+        let checksum = crc32c::crc32c(&buf);
+        let checksum_bytes = checksum.to_le_bytes();
+        buf[8] = checksum_bytes[0];
+        buf[9] = checksum_bytes[1];
+        buf[10] = checksum_bytes[2];
+        buf[11] = checksum_bytes[3];
+
+        self.dtls_transport.send(buf.freeze()).await
     }
 
     pub async fn send_dcep_open(&self, dc: &DataChannel) -> Result<()> {
@@ -774,8 +1004,8 @@ impl DataChannel {
             max_retransmits: config.max_retransmits,
             max_packet_life_time: config.max_packet_life_time,
             negotiated: config.negotiated.is_some(),
-            state: Mutex::new(DataChannelState::Connecting),
-            next_ssn: Mutex::new(0),
+            state: AtomicUsize::new(DataChannelState::Connecting as usize),
+            next_ssn: AtomicU16::new(0),
             tx: Mutex::new(Some(tx)),
             rx: TokioMutex::new(rx),
         }
