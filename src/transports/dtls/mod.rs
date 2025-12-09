@@ -1606,12 +1606,9 @@ use std::net::SocketAddr;
 #[async_trait::async_trait]
 impl PacketReceiver for DtlsTransport {
     async fn receive(&self, packet: Bytes, _addr: SocketAddr) {
-        trace!("DtlsTransport::receive len={}", packet.len());
-        // Push to the internal handshake loop
-        // We ignore errors here (e.g. if the loop is closed)
-        match self.inner.handshake_rx_feeder.send(packet).await {
+        match self.inner.handshake_rx_feeder.try_send(packet) {
             Ok(_) => {}
-            Err(e) => warn!("DtlsTransport::receive failed to feed packet: {}", e),
+            Err(_) => {}
         }
     }
 }

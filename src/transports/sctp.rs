@@ -351,6 +351,10 @@ impl SctpTransport {
     pub async fn send_dcep_open(&self, dc: &DataChannel) -> Result<()> {
         self.inner.send_dcep_open(dc).await
     }
+
+    pub fn buffered_amount(&self) -> usize {
+        self.inner.flight_size.load(Ordering::SeqCst)
+    }
 }
 
 impl Drop for SctpTransport {

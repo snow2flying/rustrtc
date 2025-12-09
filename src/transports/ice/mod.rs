@@ -1747,9 +1747,16 @@ fn hex_encode(bytes: &[u8]) -> String {
 }
 
 async fn get_local_ip() -> Result<IpAddr> {
-    let socket = UdpSocket::bind("0.0.0.0:0").await?;
-    socket.connect("8.8.8.8:80").await?;
-    Ok(socket.local_addr()?.ip())
+    let fut = async {
+        let socket = UdpSocket::bind("0.0.0.0:0").await?;
+        socket.connect("8.8.8.8:80").await?;
+        Ok::<IpAddr, std::io::Error>(socket.local_addr()?.ip())
+    };
+
+    match timeout(Duration::from_millis(200), fut).await {
+        Ok(res) => res.map_err(|e| anyhow!(e)),
+        Err(_) => Err(anyhow!("get_local_ip timed out")),
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -1761,7 +1768,17 @@ pub enum IceSocketWrapper {
 impl IceSocketWrapper {
     pub async fn send_to(&self, data: &[u8], addr: SocketAddr) -> Result<usize> {
         match self {
-            IceSocketWrapper::Udp(s) => s.send_to(data, addr).await.map_err(|e| e.into()),
+            IceSocketWrapper::Udp(s) => match s.send_to(data, addr).await {
+                Ok(len) => Ok(len),
+                Err(e) => {
+                    if let Some(code) = e.raw_os_error() {
+                        if code == 55 {
+                            return Ok(0);
+                        }
+                    }
+                    Err(e.into())
+                }
+            },
             IceSocketWrapper::Turn(c, _) => {
                 if let Some(channel) = c.get_channel(addr).await {
                     c.send_channel_data(channel, data).await?;

@@ -34,7 +34,8 @@ async fn interop_datachannel_stress_test() -> Result<()> {
     let (done_tx, mut done_rx) = tokio::sync::mpsc::channel::<()>(1);
     let done_tx = Arc::new(done_tx);
     let total_bytes_received = Arc::new(Mutex::new(0usize));
-    let total_bytes_expected = 62208 * 32;
+    let chunk_count = 256;
+    let total_bytes_expected = 62208 * chunk_count;
 
     let total_bytes_received_clone = total_bytes_received.clone();
     let done_tx_clone = done_tx.clone();
@@ -92,7 +93,7 @@ async fn interop_datachannel_stress_test() -> Result<()> {
 
                     // Send data as requested
                     let data = [0u8; 62208];
-                    for i in 0..32 {
+                    for i in 0..chunk_count {
                         if let Err(e) = rust_pc_clone.send_data(channel_id, &data).await {
                             eprintln!("Failed to send data packet {}: {}", i, e);
                             break;

@@ -11,6 +11,8 @@ use crate::{
     Attribute, Direction, MediaKind, MediaSection, Origin, RtcConfiguration, RtcError, RtcResult,
     SdpType, SessionDescription, TransportMode,
 };
+use base64::prelude::*;
+use rand_core::{OsRng, RngCore};
 use std::collections::HashMap;
 use std::{
     sync::{
@@ -86,6 +88,36 @@ struct PeerConnectionInner {
     _dtls_role_rx: watch::Receiver<Option<bool>>,
     stats_collector: Arc<StatsCollector>,
     ssrc_generator: AtomicU32,
+}
+
+fn generate_sdes_key_params() -> String {
+    let mut key_salt = [0u8; 30];
+    OsRng.fill_bytes(&mut key_salt);
+    let encoded = BASE64_STANDARD.encode(&key_salt);
+    format!("inline:{}", encoded)
+}
+
+fn parse_sdes_key_params(params: &str) -> RtcResult<Vec<u8>> {
+    if !params.starts_with("inline:") {
+        return Err(RtcError::Internal("Unsupported key params".into()));
+    }
+    let key_salt_base64 = &params[7..];
+    let key_salt_base64 = key_salt_base64.split('|').next().unwrap();
+    BASE64_STANDARD
+        .decode(key_salt_base64)
+        .map_err(|e| RtcError::Internal(format!("Invalid base64 key: {}", e)))
+}
+
+fn map_crypto_suite(suite: &str) -> RtcResult<crate::srtp::SrtpProfile> {
+    match suite {
+        "AES_CM_128_HMAC_SHA1_80" => Ok(crate::srtp::SrtpProfile::Aes128Sha1_80),
+        "AES_CM_128_HMAC_SHA1_32" => Ok(crate::srtp::SrtpProfile::Aes128Sha1_32),
+        "AEAD_AES_128_GCM" => Ok(crate::srtp::SrtpProfile::AeadAes128Gcm),
+        _ => Err(RtcError::Internal(format!(
+            "Unsupported crypto suite: {}",
+            suite
+        ))),
+    }
 }
 
 impl PeerConnection {
@@ -332,7 +364,9 @@ impl PeerConnection {
             let current_role = *self.inner.dtls_role.borrow();
             if current_role.is_none() {
                 let mut new_role = None;
-                if self.config().transport_mode == TransportMode::Rtp {
+                if self.config().transport_mode == TransportMode::Rtp
+                    || self.config().transport_mode == TransportMode::Srtp
+                {
                     new_role = Some(true);
                 } else {
                     for section in &desc.media_sections {
@@ -715,6 +749,11 @@ impl PeerConnection {
             }
         }
 
+        if self.config().transport_mode == TransportMode::Srtp {
+            self.setup_sdes(&rtp_transport)?;
+            return Ok(Box::pin(async {}));
+        }
+
         if self.config().transport_mode == TransportMode::Rtp {
             let transceivers = self.inner.transceivers.lock().unwrap();
             for t in transceivers.iter() {
@@ -855,6 +894,85 @@ impl PeerConnection {
         }
 
         Ok(Box::pin(async {}))
+    }
+
+    fn setup_sdes(&self, rtp_transport: &Arc<RtpTransport>) -> RtcResult<()> {
+        let (tx_keying, rx_keying, profile) = {
+            let remote_desc = self.inner.remote_description.lock().unwrap();
+            let local_desc = self.inner.local_description.lock().unwrap();
+
+            let remote_crypto = remote_desc
+                .as_ref()
+                .and_then(|d| d.media_sections.first())
+                .and_then(|m| m.get_crypto_attributes().into_iter().next());
+
+            let local_crypto = local_desc
+                .as_ref()
+                .and_then(|d| d.media_sections.first())
+                .and_then(|m| m.get_crypto_attributes().into_iter().next());
+
+            if let (Some(remote), Some(local)) = (remote_crypto, local_crypto) {
+                let profile = map_crypto_suite(&remote.crypto_suite)?;
+                if profile != map_crypto_suite(&local.crypto_suite)? {
+                    return Err(RtcError::Internal("Crypto suite mismatch".into()));
+                }
+
+                let rx_key_salt = parse_sdes_key_params(&remote.key_params)?;
+                let tx_key_salt = parse_sdes_key_params(&local.key_params)?;
+
+                let (key_len, salt_len) = match profile {
+                    crate::srtp::SrtpProfile::Aes128Sha1_80
+                    | crate::srtp::SrtpProfile::Aes128Sha1_32 => (16, 14),
+                    crate::srtp::SrtpProfile::AeadAes128Gcm => (16, 12),
+                    _ => (16, 14),
+                };
+
+                if rx_key_salt.len() < key_len + salt_len || tx_key_salt.len() < key_len + salt_len
+                {
+                    return Err(RtcError::Internal("Invalid key length".into()));
+                }
+
+                let rx_keying = crate::srtp::SrtpKeyingMaterial::new(
+                    rx_key_salt[..key_len].to_vec(),
+                    rx_key_salt[key_len..key_len + salt_len].to_vec(),
+                );
+                let tx_keying = crate::srtp::SrtpKeyingMaterial::new(
+                    tx_key_salt[..key_len].to_vec(),
+                    tx_key_salt[key_len..key_len + salt_len].to_vec(),
+                );
+
+                (tx_keying, rx_keying, profile)
+            } else {
+                return Err(RtcError::Internal(
+                    "Missing crypto attributes for SDES".into(),
+                ));
+            }
+        };
+
+        let session = crate::srtp::SrtpSession::new(profile, tx_keying, rx_keying)
+            .map_err(|e| RtcError::Internal(format!("SRTP error: {}", e)))?;
+
+        rtp_transport.start_srtp(session);
+
+        let transceivers = self.inner.transceivers.lock().unwrap();
+        for t in transceivers.iter() {
+            let sender_arc = t.sender.lock().unwrap().clone();
+            let receiver_arc = t.receiver.lock().unwrap().clone();
+
+            if let Some(sender) = &sender_arc {
+                sender.set_transport(rtp_transport.clone());
+            }
+
+            if let Some(receiver) = &receiver_arc {
+                receiver.set_transport(rtp_transport.clone());
+                if let Some(sender) = &sender_arc {
+                    receiver.set_feedback_ssrc(sender.ssrc());
+                }
+            }
+        }
+
+        *self.inner.rtp_transport.lock().unwrap() = Some(rtp_transport.clone());
+        Ok(())
     }
 
     fn setup_srtp(
@@ -1179,6 +1297,15 @@ impl PeerConnection {
         }
     }
 
+    pub async fn sctp_buffered_amount(&self) -> usize {
+        let transport = self.inner.sctp_transport.lock().unwrap().clone();
+        if let Some(transport) = transport {
+            transport.buffered_amount()
+        } else {
+            0
+        }
+    }
+
     pub async fn get_stats(&self) -> RtcResult<StatsReport> {
         gather_once(&[self.inner.stats_collector.clone()]).await
     }
@@ -1225,9 +1352,8 @@ async fn run_gathering_loop(
                         let mut local_guard = inner.local_description.lock().unwrap();
                         if let Some(desc) = local_guard.as_mut() {
                             desc.add_candidates(&candidate_strs);
-                            return true;
                         }
-                        false
+                        true
                     } else {
                         true
                     }
@@ -1596,6 +1722,30 @@ impl PeerConnectionInner {
             if let Some(sender) = sender_info {
                 Self::attach_sender_attributes(&mut section, &sender);
             }
+
+            if self.config.transport_mode == TransportMode::Srtp {
+                let mut suite = "AES_CM_128_HMAC_SHA1_80".to_string();
+                if sdp_type == SdpType::Answer {
+                    let remote_desc = self.remote_description.lock().unwrap();
+                    if let Some(remote) = &*remote_desc {
+                        if let Some(c) = remote
+                            .media_sections
+                            .iter()
+                            .flat_map(|m| m.get_crypto_attributes())
+                            .find(|c| map_crypto_suite(&c.crypto_suite).is_ok())
+                        {
+                            suite = c.crypto_suite.clone();
+                        }
+                    }
+                }
+
+                let key_params = generate_sdes_key_params();
+                let crypto_val = format!("1 {} {}|2^31|1:1", suite, key_params);
+                section
+                    .attributes
+                    .push(Attribute::new("crypto", Some(crypto_val)));
+            }
+
             desc.media_sections.push(section);
         }
 
@@ -2899,5 +3049,37 @@ a=ssrc-group:FID 12345 67890\r\n";
         println!("RTX SSRC: {:?}", receiver.rtx_ssrc());
         assert_eq!(receiver.ssrc(), 12345); // Should be Primary
         assert_eq!(receiver.rtx_ssrc(), Some(67890));
+    }
+
+    #[test]
+    fn test_sdes_key_generation_and_parsing() {
+        let params = generate_sdes_key_params();
+        assert!(params.starts_with("inline:"));
+
+        let key = parse_sdes_key_params(&params).expect("Failed to parse generated params");
+        assert_eq!(key.len(), 30); // 30 bytes for AES_CM_128_HMAC_SHA1_80 (16 key + 14 salt)
+
+        // Test invalid params
+        assert!(parse_sdes_key_params("invalid").is_err());
+        assert!(parse_sdes_key_params("inline:invalid_base64").is_err());
+    }
+
+    #[tokio::test]
+    async fn create_offer_srtp_mode_includes_crypto() {
+        use crate::TransportMode;
+        let mut config = RtcConfiguration::default();
+        config.transport_mode = TransportMode::Srtp;
+        let pc = PeerConnection::new(config);
+        pc.add_transceiver(MediaKind::Audio, TransceiverDirection::SendRecv);
+
+        let offer = pc.create_offer().unwrap();
+        let section = &offer.media_sections[0];
+
+        // Should have crypto attribute
+        let crypto = section.attributes.iter().find(|a| a.key == "crypto");
+        assert!(crypto.is_some(), "Missing crypto attribute in SRTP mode");
+
+        let crypto_val = crypto.unwrap().value.as_ref().unwrap();
+        assert!(crypto_val.starts_with("1 AES_CM_128_HMAC_SHA1_80 inline:"));
     }
 }

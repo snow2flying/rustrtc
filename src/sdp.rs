@@ -511,6 +511,37 @@ impl Direction {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CryptoAttribute {
+    pub tag: u16,
+    pub crypto_suite: String,
+    pub key_params: String,
+    pub session_params: Option<String>,
+}
+
+impl CryptoAttribute {
+    pub fn parse(value: &str) -> Option<Self> {
+        // a=crypto:<tag> <crypto-suite> <key-params> [<session-params>]
+        let mut parts = value.split_whitespace();
+        let tag = parts.next()?.parse().ok()?;
+        let crypto_suite = parts.next()?.to_string();
+        let key_params = parts.next()?.to_string();
+        let session_params = parts.collect::<Vec<&str>>().join(" ");
+        let session_params = if session_params.is_empty() {
+            None
+        } else {
+            Some(session_params)
+        };
+
+        Some(Self {
+            tag,
+            crypto_suite,
+            key_params,
+            session_params,
+        })
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct MediaSection {
     pub kind: MediaKind,
@@ -545,6 +576,14 @@ impl MediaSection {
     pub fn attribute(mut self, key: impl Into<String>, value: Option<String>) -> Self {
         self.attributes.push(Attribute::new(key, value));
         self
+    }
+
+    pub fn get_crypto_attributes(&self) -> Vec<CryptoAttribute> {
+        self.attributes
+            .iter()
+            .filter(|a| a.key == "crypto")
+            .filter_map(|a| a.value.as_ref().and_then(|v| CryptoAttribute::parse(v)))
+            .collect()
     }
 
     pub fn apply_config(&mut self, config: &RtcConfiguration) {

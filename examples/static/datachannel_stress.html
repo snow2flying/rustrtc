@@ -28,6 +28,8 @@
     <h1>DataChannel Stress Test</h1>
     <div style="margin-bottom: 10px;">
         <label><input type="checkbox" id="usePingPong" checked> Enable Ping-Pong Handshake</label>
+        <label style="margin-left: 20px;">Chunk Count <input type="text" id="chunkCount" value="256"></label>
+        <label style="margin-left: 20px;">Chunk Size <input type="text" id="chunkSize" value="62208"></label>
     </div>
     <div id="status">Status: Ready</div>
     <button id="startBtn" onclick="startTest()">Start Test</button>
@@ -38,8 +40,6 @@
     <div id="log"></div>
 
     <script>
-        const TOTAL_EXPECTED = 62208 * 128;
-        document.getElementById('bytesExpected').innerText = TOTAL_EXPECTED;
 
         let pc;
         let dc;
@@ -57,6 +57,11 @@
         }
 
         async function startTest() {
+            let chunkCount = parseInt(document.getElementById('chunkCount').value);
+            let chunkSize = parseInt(document.getElementById('chunkSize').value);
+            let totalExpected = chunkSize * chunkCount;
+            document.getElementById('bytesExpected').innerText = totalExpected;
+
             document.getElementById('startBtn').disabled = true;
             bytesReceived = 0;
             document.getElementById('bytesReceived').innerText = '0';
@@ -100,10 +105,10 @@
                 bytesReceived += data.length;
 
                 document.getElementById('bytesReceived').innerText = bytesReceived;
-                const percent = (bytesReceived / TOTAL_EXPECTED * 100).toFixed(1);
+                const percent = (bytesReceived / totalExpected * 100).toFixed(1);
                 document.getElementById('percent').innerText = percent;
 
-                if (bytesReceived >= TOTAL_EXPECTED) {
+                if (bytesReceived >= totalExpected) {
                     const duration = (performance.now() - startTime) / 1000;
                     const speed = (bytesReceived / 1024 / 1024 / duration).toFixed(2);
                     log(`Test Complete! Received ${bytesReceived} bytes in ${duration.toFixed(2)}s (${speed} MB/s)`);
@@ -141,7 +146,7 @@
             const response = await fetch('/offer', {
                 method: 'POST',
                 headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({ sdp: offerSdp, ping_pong: usePingPong })
+                body: JSON.stringify({ sdp: offerSdp, ping_pong: usePingPong, chunk_count: chunkCount, chunk_size: chunkSize })
             });
 
             const answerData = await response.json();

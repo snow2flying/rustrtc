@@ -37,6 +37,8 @@ struct OfferRequest {
     sdp: String,
     #[serde(default)]
     ping_pong: bool,
+    chunk_count: Option<usize>,
+    chunk_size: Option<usize>,
 }
 
 #[derive(Serialize)]
@@ -62,6 +64,9 @@ async fn offer(Json(payload): Json<OfferRequest>) -> impl IntoResponse {
     pc.set_local_description(answer.clone()).unwrap();
 
     let pc_clone = pc.clone();
+    let chunk_count = payload.chunk_count.unwrap_or(256);
+    let chunk_size = payload.chunk_size.unwrap_or(62208);
+
     tokio::spawn(async move {
         while let Some(ev) = pc_clone.recv().await {
             match ev {
@@ -102,9 +107,12 @@ async fn offer(Json(payload): Json<OfferRequest>) -> impl IntoResponse {
                             tokio::time::sleep(std::time::Duration::from_secs(1)).await;
                         }
 
-                        info!("Starting to send data...");
-                        let data = [0u8; 62208];
-                        for i in 0..128 {
+                        info!(
+                            "Starting to send data... chunk_count={} chunk_size={}",
+                            chunk_count, chunk_size
+                        );
+                        let data = vec![0u8; chunk_size];
+                        for i in 0..chunk_count {
                             if let Err(e) = pc_sender.send_data(channel_id, &data).await {
                                 info!("Failed to send data packet {}: {}", i, e);
                                 break;

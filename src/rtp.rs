@@ -1020,4 +1020,40 @@ mod tests {
             .unwrap();
         assert!(is_rtcp(&pli));
     }
+
+    #[test]
+    fn sdes_roundtrip() {
+        let sdes = SourceDescription {
+            chunks: vec![SdesChunk {
+                ssrc: 0x12345678,
+                items: vec![
+                    SdesItem {
+                        ty: 1, // CNAME
+                        text: "user@host".to_string(),
+                    },
+                    SdesItem {
+                        ty: 2, // NAME
+                        text: "My Name".to_string(),
+                    },
+                ],
+            }],
+        };
+        let packet = RtcpPacket::SourceDescription(sdes.clone());
+        let bytes = marshal_rtcp_packets(&[packet]).unwrap();
+        let parsed = parse_rtcp_packets(&bytes).unwrap();
+
+        match &parsed[0] {
+            RtcpPacket::SourceDescription(decoded) => {
+                assert_eq!(decoded.chunks.len(), 1);
+                let chunk = &decoded.chunks[0];
+                assert_eq!(chunk.ssrc, 0x12345678);
+                assert_eq!(chunk.items.len(), 2);
+                assert_eq!(chunk.items[0].ty, 1);
+                assert_eq!(chunk.items[0].text, "user@host");
+                assert_eq!(chunk.items[1].ty, 2);
+                assert_eq!(chunk.items[1].text, "My Name");
+            }
+            other => panic!("unexpected packet: {other:?}"),
+        }
+    }
 }
