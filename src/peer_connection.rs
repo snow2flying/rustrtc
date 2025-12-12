@@ -1785,12 +1785,10 @@ impl PeerConnectionInner {
             ));
         }
 
-        if *mode != TransportMode::Rtp {
-            section.attributes.push(Attribute::new(
-                "ssrc",
-                Some(format!("{} cname:{}", ssrc, cname)),
-            ));
-        }
+        section.attributes.push(Attribute::new(
+            "ssrc",
+            Some(format!("{} cname:{}", ssrc, cname)),
+        ));
 
         if *mode == TransportMode::WebRtc {
             section.attributes.push(Attribute::new(
@@ -2943,7 +2941,17 @@ mod tests {
         let mut config = RtcConfiguration::default();
         config.transport_mode = TransportMode::Rtp;
         let pc = PeerConnection::new(config);
-        pc.add_transceiver(MediaKind::Audio, TransceiverDirection::SendRecv);
+        let transceiver = pc.add_transceiver(MediaKind::Audio, TransceiverDirection::SendRecv);
+
+        // Add a sender so direction is not downgraded and RTP mode can advertise SSRC.
+        let (_, track, _) = sample_track(crate::media::frame::MediaKind::Audio, 48000);
+        let params = RtpCodecParameters {
+            payload_type: 111,
+            clock_rate: 48000,
+            channels: 2,
+        };
+        let sender = Arc::new(RtpSender::new(track, 12345, "stream".to_string(), params));
+        transceiver.set_sender(Some(sender));
 
         let offer = pc.create_offer().unwrap();
         let section = &offer.media_sections[0];
@@ -2967,8 +2975,8 @@ mod tests {
         // Should NOT have msid in media section
         assert!(!section.attributes.iter().any(|a| a.key == "msid"));
 
-        // Should NOT have ssrc in media section
-        assert!(!section.attributes.iter().any(|a| a.key == "ssrc"));
+        // Should have ssrc in media section
+        assert!(section.attributes.iter().any(|a| a.key == "ssrc"));
 
         // Protocol should be RTP/AVP
         assert_eq!(section.protocol, "RTP/AVP");
