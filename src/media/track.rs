@@ -522,6 +522,7 @@ mod tests {
     async fn audio_sample_flow() {
         let (source, track, _) = sample_track(MediaKind::Audio, 8);
         let frame = AudioFrame {
+            rtp_timestamp: None,
             timestamp: Duration::from_millis(10),
             sample_rate: 48_000,
             channels: 2,
@@ -576,6 +577,7 @@ mod tests {
         let subscriber_b = relay.subscribe();
 
         let frame = AudioFrame {
+            rtp_timestamp: None,
             timestamp: Duration::from_millis(5),
             sample_rate: 48_000,
             channels: 2,

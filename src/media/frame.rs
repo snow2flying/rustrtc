@@ -34,6 +34,7 @@ pub enum VideoPixelFormat {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct AudioFrame {
     pub timestamp: Duration,
+    pub rtp_timestamp: Option<u32>,
     pub sample_rate: u32,
     pub channels: u8,
     pub samples: u32,
@@ -47,6 +48,7 @@ impl Default for AudioFrame {
     fn default() -> Self {
         Self {
             timestamp: Duration::default(),
+            rtp_timestamp: None,
             sample_rate: 48_000,
             channels: 2,
             samples: 0,
@@ -128,7 +130,7 @@ impl MediaSample {
                 f.data,
                 f.timestamp,
                 false,
-                None,
+                f.rtp_timestamp,
                 Vec::new(),
                 f.sequence_number,
                 f.payload_type,
@@ -186,6 +188,7 @@ impl MediaSample {
                 };
                 MediaSample::Audio(AudioFrame {
                     timestamp,
+                    rtp_timestamp: Some(packet.header.timestamp),
                     sample_rate: clock_rate,
                     channels,
                     samples,
