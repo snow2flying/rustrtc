@@ -1214,11 +1214,7 @@ impl IceCandidate {
     }
 
     pub fn base_address(&self) -> SocketAddr {
-        if self.typ == IceCandidateType::ServerReflexive {
-            self.related_address.unwrap_or(self.address)
-        } else {
-            self.address
-        }
+        self.related_address.unwrap_or(self.address)
     }
 
     fn server_reflexive(base: SocketAddr, mapped: SocketAddr, component: u16) -> Self {
@@ -1269,10 +1265,12 @@ impl IceCandidate {
             self.typ.as_str().into(),
         ];
         if let Some(addr) = self.related_address {
-            parts.push("raddr".into());
-            parts.push(addr.ip().to_string());
-            parts.push("rport".into());
-            parts.push(addr.port().to_string());
+            if self.typ != IceCandidateType::Host {
+                parts.push("raddr".into());
+                parts.push(addr.ip().to_string());
+                parts.push("rport".into());
+                parts.push(addr.port().to_string());
+            }
         }
         parts.join(" ")
     }
@@ -1556,7 +1554,9 @@ impl IceGatherer {
                         {
                             let mut ext_addr = addr;
                             ext_addr.set_ip(parsed_ip);
-                            self.push_candidate(IceCandidate::host(ext_addr, 1));
+                            let mut cand = IceCandidate::host(ext_addr, 1);
+                            cand.related_address = Some(addr);
+                            self.push_candidate(cand);
                         } else {
                             self.push_candidate(IceCandidate::host(addr, 1));
                         }

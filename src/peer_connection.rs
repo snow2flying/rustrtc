@@ -1806,8 +1806,18 @@ impl PeerConnectionInner {
                     candidates
                         .iter()
                         .find(|c| c.address.ip() == target_ip)
-                        .or_else(|| candidates.iter().find(|c| !c.address.ip().is_loopback()))
-                        .or_else(|| candidates.first())
+                        .or_else(|| {
+                            // If we haven't found the target IP yet, try any non-loopback candidate
+                            candidates.iter().find(|c| !c.address.ip().is_loopback())
+                        })
+                        // If target_ip is not loopback, avoid falling back to loopback if possible
+                        .or_else(|| {
+                            if target_ip.is_loopback() {
+                                candidates.first()
+                            } else {
+                                None
+                            }
+                        })
                 } else {
                     candidates
                         .iter()
