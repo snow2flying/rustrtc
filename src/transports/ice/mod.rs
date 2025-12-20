@@ -243,7 +243,8 @@ impl IceTransportRunner {
         let state = *inner.state.borrow();
         if state == IceTransportState::Connected || state == IceTransportState::Disconnected {
             let elapsed = inner.last_received.lock().unwrap().elapsed();
-            if elapsed > Duration::from_secs(30) {
+            let ice_conn_timeout = inner.config.ice_connection_timeout;
+            if elapsed > ice_conn_timeout {
                 let _ = inner.state.send(IceTransportState::Failed);
             } else if elapsed > Duration::from_secs(5) {
                 if state != IceTransportState::Disconnected {

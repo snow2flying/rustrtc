@@ -1,6 +1,7 @@
 pub use crate::transports::datachannel::*;
 use crate::transports::dtls::{DtlsState, DtlsTransport};
 use crate::transports::ice::stun::random_u32;
+use crate::RtcConfiguration;
 use anyhow::Result;
 use bytes::{Buf, BufMut, Bytes, BytesMut};
 use std::collections::BTreeMap;
@@ -11,15 +12,12 @@ use tokio::sync::{Notify, mpsc};
 use tracing::{debug, info, trace, warn};
 
 // RTO Constants (RFC 4960)
-const RTO_INITIAL: f64 = 1.0;
-const RTO_MIN: f64 = 0.1; // Lower RTO_MIN for faster recovery in high-speed networks
-const RTO_MAX: f64 = 60.0;
 const RTO_ALPHA: f64 = 0.125;
 const RTO_BETA: f64 = 0.25;
 
 // Flow Control Constants
-const CWND_INITIAL: usize = 1200 * 20;
-const MAX_BURST: usize = 20; // RFC 4960 Section 7.2.4
+const CWND_INITIAL: usize = 1200 * 40; // Start with 40 MTUs for a balance of speed and stability
+const MAX_BURST: usize = 4; // RFC 4960 Section 7.2.4
 
 #[derive(Debug, Clone)]
 struct ChunkRecord {
@@ -43,8 +41,8 @@ pub enum SctpState {
 // SCTP Constants
 const SCTP_COMMON_HEADER_SIZE: usize = 12;
 const CHUNK_HEADER_SIZE: usize = 4;
-const MAX_SCTP_PACKET_SIZE: usize = 1400; // Increased for better throughput
-const DEFAULT_MAX_PAYLOAD_SIZE: usize = 1372; // 1400 - 12 (common) - 16 (data header)
+const MAX_SCTP_PACKET_SIZE: usize = 1200;
+const DEFAULT_MAX_PAYLOAD_SIZE: usize = 1172; // 1200 - 12 (common) - 16 (data header)
 const LOCAL_RWND_BYTES: usize = 16 * 1024 * 1024;
 const DUP_THRESH: u8 = 3;
 
@@ -93,14 +91,18 @@ struct RtoCalculator {
     srtt: f64,
     rttvar: f64,
     rto: f64,
+    min: f64,
+    max: f64,
 }
 
 impl RtoCalculator {
-    fn new() -> Self {
+    fn new(initial: f64, min: f64, max: f64) -> Self {
         Self {
             srtt: 0.0,
             rttvar: 0.0,
-            rto: RTO_INITIAL,
+            rto: initial,
+            min,
+            max,
         }
     }
 
@@ -112,11 +114,11 @@ impl RtoCalculator {
             self.rttvar = (1.0 - RTO_BETA) * self.rttvar + RTO_BETA * (self.srtt - rtt).abs();
             self.srtt = (1.0 - RTO_ALPHA) * self.srtt + RTO_ALPHA * rtt;
         }
-        self.rto = (self.srtt + 4.0 * self.rttvar).clamp(RTO_MIN, RTO_MAX);
+        self.rto = (self.srtt + 4.0 * self.rttvar).clamp(self.min, self.max);
     }
 
     fn backoff(&mut self) {
-        self.rto = (self.rto * 2.0).min(RTO_MAX);
+        self.rto = (self.rto * 2.0).min(self.max);
     }
 }
 
@@ -159,6 +161,9 @@ struct SctpInner {
 
     // Fast Recovery
     fast_recovery_exit_tsn: AtomicU32,
+
+    // Association Retransmission Limit
+    max_association_retransmits: u32,
 
     // Receiver Window Tracking
     used_rwnd: AtomicUsize,
@@ -350,6 +355,7 @@ impl SctpTransport {
         remote_port: u16,
         new_data_channel_tx: Option<mpsc::UnboundedSender<Arc<DataChannel>>>,
         is_client: bool,
+        config: &RtcConfiguration,
     ) -> (
         Arc<Self>,
         impl std::future::Future<Output = ()> + Send + 'static,
@@ -369,7 +375,11 @@ impl SctpTransport {
             is_client,
             sent_queue: Mutex::new(BTreeMap::new()),
             received_queue: Mutex::new(BTreeMap::new()),
-            rto_state: Mutex::new(RtoCalculator::new()),
+            rto_state: Mutex::new(RtoCalculator::new(
+                config.sctp_rto_initial.as_secs_f64(),
+                config.sctp_rto_min.as_secs_f64(),
+                config.sctp_rto_max.as_secs_f64(),
+            )),
             flight_size: AtomicUsize::new(0),
             cwnd: AtomicUsize::new(CWND_INITIAL),
             ssthresh: AtomicUsize::new(usize::MAX),
@@ -385,6 +395,7 @@ impl SctpTransport {
             reconfig_request_sn: AtomicU32::new(0),
             peer_reconfig_request_sn: AtomicU32::new(u32::MAX), // Initial value to allow 0
             fast_recovery_exit_tsn: AtomicU32::new(0),
+            max_association_retransmits: config.sctp_max_association_retransmits,
             used_rwnd: AtomicUsize::new(0),
             packets_received: AtomicU64::new(0),
             cached_rto_timeout: Mutex::new(None),
@@ -677,10 +688,22 @@ impl SctpInner {
                             abandoned_tsn = Some(*tsn);
                         }
                     } else {
-                        to_retransmit.push((*tsn, record.payload.clone()));
-                        record.transmit_count += 1;
-                        record.sent_time = now; // restart timer; don't sample RTT on retransmit
-                        record.fast_retransmit = false; // Reset flag on timeout to allow future fast retransmit if needed
+                        // Check for association-wide retransmission limit
+                        if record.transmit_count >= self.max_association_retransmits && self.max_association_retransmits > 0 {
+                            warn!("SCTP Association retransmission limit reached ({}), closing", self.max_association_retransmits);
+                            self.set_state(SctpState::Closed);
+                            return Ok(());
+                        }
+
+                        // RFC 4960 Section 6.3.3: Retransmit only the earliest outstanding DATA chunks
+                        // that fit into a single packet of size MTU.
+                        let current_len: usize = to_retransmit.iter().map(|(_, p): &(u32, Bytes)| p.len()).sum();
+                        if current_len + record.payload.len() < DEFAULT_MAX_PAYLOAD_SIZE {
+                            to_retransmit.push((*tsn, record.payload.clone()));
+                            record.transmit_count += 1;
+                            record.sent_time = now; // restart timer; don't sample RTT on retransmit
+                            record.fast_retransmit = false; // Reset flag on timeout to allow future fast retransmit if needed
+                        }
                     }
                 }
             }
@@ -703,9 +726,9 @@ impl SctpInner {
 
             // Reduce ssthresh and cwnd (RFC 4960 / Modern TCP)
             let cwnd = self.cwnd.load(Ordering::SeqCst);
-            let new_ssthresh = (cwnd / 2).max(MAX_SCTP_PACKET_SIZE * 32); // Higher minimum ssthresh
+            let new_ssthresh = (cwnd / 2).max(MAX_SCTP_PACKET_SIZE * 4); // Standard minimum ssthresh
             self.ssthresh.store(new_ssthresh, Ordering::SeqCst);
-            self.cwnd.store(CWND_INITIAL, Ordering::SeqCst); // Reset to Initial Window for faster recovery
+            self.cwnd.store(MAX_SCTP_PACKET_SIZE, Ordering::SeqCst); // Reset to 1 MTU on timeout
             self.partial_bytes_acked.store(0, Ordering::SeqCst);
             // Exit Fast Recovery on timeout
             self.fast_recovery_exit_tsn.store(0, Ordering::SeqCst);
@@ -831,6 +854,9 @@ impl SctpInner {
                 CT_DATA => self.handle_data(chunk_flags, chunk_value).await?,
                 CT_SACK => self.handle_sack(chunk_value).await?,
                 CT_HEARTBEAT => self.handle_heartbeat(chunk_value).await?,
+                CT_HEARTBEAT_ACK => {
+                    trace!("SCTP HEARTBEAT ACK received");
+                }
                 CT_FORWARD_TSN => self.handle_forward_tsn(chunk_value).await?,
                 CT_RECONFIG => self.handle_reconfig(chunk_value).await?,
                 CT_ABORT => {
@@ -1090,7 +1116,7 @@ impl SctpInner {
                 if !in_fast_recovery {
                     // Enter Fast Recovery
                     let cwnd = self.cwnd.load(Ordering::SeqCst);
-                    let new_ssthresh = (cwnd / 2).max(MAX_SCTP_PACKET_SIZE * 32);
+                    let new_ssthresh = (cwnd / 2).max(MAX_SCTP_PACKET_SIZE * 4);
                     self.ssthresh.store(new_ssthresh, Ordering::SeqCst);
                     self.cwnd.store(new_ssthresh, Ordering::SeqCst);
                     self.partial_bytes_acked.store(0, Ordering::SeqCst);
@@ -2120,8 +2146,8 @@ mod tests {
 
     #[test]
     fn test_rto_calculator() {
-        let mut calc = RtoCalculator::new();
-        assert_eq!(calc.rto, RTO_INITIAL);
+        let mut calc = RtoCalculator::new(1.0, 0.2, 60.0);
+        assert_eq!(calc.rto, 1.0);
 
         // First measurement: RTT = 1.0
         calc.update(1.0);
@@ -2147,7 +2173,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_rto_backoff() {
-        let mut calc = RtoCalculator::new();
+        let mut calc = RtoCalculator::new(1.0, 0.2, 60.0);
         calc.update(0.1); // RTT 100ms
         assert!(calc.rto >= 0.2); // Min RTO is 0.2s
 
@@ -2319,6 +2345,64 @@ mod tests {
         packet_copy[11] = 0;
         let calculated_again = crc32c::crc32c(&packet_copy);
         assert_eq!(received_checksum, calculated_again);
+    }
+
+    #[tokio::test]
+    async fn test_sctp_association_retransmission_limit() {
+        let (socket_tx, _) = tokio::sync::watch::channel(None);
+        let ice_conn = crate::transports::ice::conn::IceConn::new(socket_tx.subscribe(), "127.0.0.1:5000".parse().unwrap());
+        let cert = crate::transports::dtls::generate_certificate().unwrap();
+        let (dtls, _, _) = DtlsTransport::new(ice_conn, cert, true, 100).await.unwrap();
+
+        let config = RtcConfiguration::default();
+        let mut config = config;
+        config.sctp_max_association_retransmits = 2;
+
+        let (sctp, _) = SctpTransport::new(
+            dtls,
+            mpsc::channel(1).1,
+            Arc::new(Mutex::new(Vec::new())),
+            5000,
+            5000,
+            None,
+            true,
+            &config,
+        );
+
+        // Set state to Connecting
+        *sctp.inner.state.lock().unwrap() = SctpState::Connecting;
+
+        // Add a chunk to sent queue
+        {
+            let mut sent_queue = sctp.inner.sent_queue.lock().unwrap();
+            sent_queue.insert(
+                100,
+                ChunkRecord {
+                    payload: Bytes::from_static(b"test"),
+                    sent_time: Instant::now() - Duration::from_secs(10),
+                    transmit_count: 1,
+                    missing_reports: 0,
+                    stream_id: 0,
+                    abandoned: false,
+                    fast_retransmit: false,
+                },
+            );
+        }
+
+        // First timeout: transmit_count becomes 2
+        sctp.inner.handle_timeout().await.unwrap();
+        assert_eq!(sctp.inner.state.lock().unwrap().clone(), SctpState::Connecting);
+
+        // Manually set sent_time back to trigger another timeout
+        {
+            let mut sent_queue = sctp.inner.sent_queue.lock().unwrap();
+            let record = sent_queue.get_mut(&100).unwrap();
+            record.sent_time = Instant::now() - Duration::from_secs(10);
+        }
+
+        // Second timeout: transmit_count is 2, which is >= limit (2), should close
+        sctp.inner.handle_timeout().await.unwrap();
+        assert_eq!(sctp.inner.state.lock().unwrap().clone(), SctpState::Closed);
     }
 
     #[tokio::test]

@@ -228,6 +228,11 @@ pub struct RtcConfiguration {
     pub disable_ipv6: bool,
     pub ssrc_start: u32,
     pub stun_timeout: std::time::Duration,
+    pub ice_connection_timeout: std::time::Duration,
+    pub sctp_rto_initial: std::time::Duration,
+    pub sctp_rto_min: std::time::Duration,
+    pub sctp_rto_max: std::time::Duration,
+    pub sctp_max_association_retransmits: u32,
     pub dtls_buffer_size: usize,
 }
 
@@ -246,6 +251,11 @@ impl Default for RtcConfiguration {
             disable_ipv6: false,
             ssrc_start: 10000,
             stun_timeout: std::time::Duration::from_secs(5),
+            ice_connection_timeout: std::time::Duration::from_secs(30),
+            sctp_rto_initial: std::time::Duration::from_secs(1),
+            sctp_rto_min: std::time::Duration::from_millis(200),
+            sctp_rto_max: std::time::Duration::from_secs(60),
+            sctp_max_association_retransmits: 0,
             dtls_buffer_size: 100,
         }
     }
@@ -336,5 +346,31 @@ impl RtcConfigurationBuilder {
 impl From<RtcConfigurationBuilder> for RtcConfiguration {
     fn from(builder: RtcConfigurationBuilder) -> Self {
         builder.build()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::Duration;
+
+    #[test]
+    fn test_rtc_configuration_defaults() {
+        let config = RtcConfiguration::default();
+        assert_eq!(config.ice_connection_timeout, Duration::from_secs(30));
+        assert_eq!(config.sctp_rto_initial, Duration::from_secs(1));
+        assert_eq!(config.sctp_rto_min, Duration::from_millis(200));
+        assert_eq!(config.sctp_rto_max, Duration::from_secs(60));
+        assert_eq!(config.sctp_max_association_retransmits, 0);
+    }
+
+    #[test]
+    fn test_rtc_configuration_builder() {
+        let config = RtcConfigurationBuilder::new()
+            .stun_timeout(Duration::from_secs(10))
+            .build();
+        assert_eq!(config.stun_timeout, Duration::from_secs(10));
+        // Verify other defaults are still there
+        assert_eq!(config.ice_connection_timeout, Duration::from_secs(30));
     }
 }

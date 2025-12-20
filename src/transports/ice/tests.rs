@@ -289,7 +289,25 @@ async fn turn_connection_relay_to_host() -> Result<()> {
     turn_server.stop().await?;
     Ok(())
 }
-
+#[tokio::test]
+async fn test_ice_connection_timeout() -> Result<()> {
+    let mut config = RtcConfiguration::default();
+    config.ice_connection_timeout = Duration::from_millis(100);
+    
+    let (transport, runner) = IceTransportBuilder::new(config).build();
+    tokio::spawn(runner);
+    
+    // Set state to Connected to trigger keepalive tick logic
+    transport.inner.state.send(IceTransportState::Connected).unwrap();
+    
+    // Wait for more than 1 second (interval is 1s)
+    tokio::time::sleep(Duration::from_millis(1200)).await;
+    
+    // Should be Failed now
+    assert_eq!(transport.state(), IceTransportState::Failed);
+    
+    Ok(())
+}
 const TEST_USERNAME: &str = "test";
 const TEST_PASSWORD: &str = "test";
 const TEST_REALM: &str = ".turn";

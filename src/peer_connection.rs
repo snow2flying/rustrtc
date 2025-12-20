@@ -1107,6 +1107,7 @@ impl PeerConnection {
             sctp_port,
             Some(dc_tx),
             is_client,
+            self.config(),
         );
         *self.inner.sctp_transport.lock().unwrap() = Some(sctp);
 
