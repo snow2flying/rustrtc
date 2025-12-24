@@ -2083,6 +2083,7 @@ impl PeerConnectionInner {
             }
 
             if mode == TransportMode::WebRtc {
+                section.connection = Some("IN IP4 0.0.0.0".to_string());
                 section
                     .attributes
                     .push(Attribute::new("ice-ufrag", Some(ice_username.clone())));
