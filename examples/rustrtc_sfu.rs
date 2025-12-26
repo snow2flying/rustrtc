@@ -209,6 +209,12 @@ async fn session(
         return axum::http::StatusCode::INTERNAL_SERVER_ERROR.into_response();
     }
 
+    // Wait for at least one candidate with 3s timeout
+    {
+        let mut rx = pc.subscribe_ice_candidates();
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(3), rx.recv()).await;
+    }
+
     let answer = match pc.create_answer() {
         Ok(a) => a,
         Err(e) => {
