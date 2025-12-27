@@ -1033,9 +1033,13 @@ impl PeerConnection {
             .await;
 
         // Update receivers immediately to ensure listeners are registered
+        // Also set transport reference on transceivers for late-attached senders
         {
             let transceivers = self.inner.transceivers.lock().unwrap();
             for t in transceivers.iter() {
+                // Store transport reference for late senders
+                t.set_rtp_transport(Arc::downgrade(&rtp_transport));
+
                 let receiver_arc = t.receiver.lock().unwrap().clone();
                 if let Some(receiver) = &receiver_arc {
                     receiver.set_transport(rtp_transport.clone());
@@ -2462,6 +2466,7 @@ pub struct RtpTransceiver {
     mid: Mutex<Option<String>>,
     sender: Mutex<Option<Arc<RtpSender>>>,
     receiver: Mutex<Option<Arc<RtpReceiver>>>,
+    rtp_transport: Mutex<Option<Weak<RtpTransport>>>,
 }
 
 impl RtpTransceiver {
@@ -2473,6 +2478,7 @@ impl RtpTransceiver {
             mid: Mutex::new(None),
             sender: Mutex::new(None),
             receiver: Mutex::new(None),
+            rtp_transport: Mutex::new(None),
         }
     }
 
@@ -2505,7 +2511,24 @@ impl RtpTransceiver {
     }
 
     pub fn set_sender(&self, sender: Option<Arc<RtpSender>>) {
+        if let Some(ref s) = sender {
+            // If transport is already established, connect the sender to it
+            if let Some(weak_transport) = self.rtp_transport.lock().unwrap().as_ref() {
+                if let Some(transport) = weak_transport.upgrade() {
+                    tracing::info!(
+                        "set_sender: connecting late sender ssrc={} to existing transport",
+                        s.ssrc()
+                    );
+                    s.set_transport(transport);
+                }
+            }
+        }
         *self.sender.lock().unwrap() = sender;
+    }
+
+    /// Set the RTP transport reference. Called by start_dtls when transport is established.
+    pub fn set_rtp_transport(&self, transport: Weak<RtpTransport>) {
+        *self.rtp_transport.lock().unwrap() = Some(transport);
     }
 
     pub fn receiver(&self) -> Option<Arc<RtpReceiver>> {
