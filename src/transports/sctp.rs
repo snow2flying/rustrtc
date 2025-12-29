@@ -884,7 +884,7 @@ impl SctpInner {
                 CT_FORWARD_TSN => self.handle_forward_tsn(chunk_value).await?,
                 CT_RECONFIG => self.handle_reconfig(chunk_value).await?,
                 CT_ABORT => {
-                    warn!("SCTP ABORT received");
+                    info!("SCTP ABORT received");
                     self.set_state(SctpState::Closed);
                 }
                 CT_SHUTDOWN => {
