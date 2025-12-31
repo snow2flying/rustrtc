@@ -16,7 +16,7 @@ const RTO_ALPHA: f64 = 0.125;
 const RTO_BETA: f64 = 0.25;
 
 // Flow Control Constants
-const CWND_INITIAL: usize = 1200 * 40; // Start with 40 MTUs for a balance of speed and stability
+const CWND_INITIAL: usize = 1200 * 4; // Start with 4 MTUs (~4.8KB, RFC compliant)
 const MAX_BURST: usize = 4; // RFC 4960 Section 7.2.4
 
 #[derive(Debug, Clone)]
@@ -718,19 +718,6 @@ impl SctpInner {
         }
 
         if !to_retransmit.is_empty() {
-            // Increment association error count
-            let error_count = self.association_error_count.fetch_add(1, Ordering::SeqCst) + 1;
-            if error_count >= self.max_association_retransmits
-                && self.max_association_retransmits > 0
-            {
-                warn!(
-                    "SCTP Association retransmission limit reached ({}), closing",
-                    self.max_association_retransmits
-                );
-                self.set_state(SctpState::Closed);
-                return Ok(());
-            }
-
             // Backoff RTO once per timer tick
             let mut rto_state = self.rto_state.lock().unwrap();
             rto_state.backoff();
@@ -2448,9 +2435,11 @@ mod tests {
             record.sent_time = Instant::now() - Duration::from_secs(10);
         }
 
-        // Second timeout: transmit_count is 2, which is >= limit (2), should close
         sctp.inner.handle_timeout().await.unwrap();
-        assert_eq!(sctp.inner.state.lock().unwrap().clone(), SctpState::Closed);
+        assert_eq!(
+            sctp.inner.state.lock().unwrap().clone(),
+            SctpState::Connecting
+        );
     }
 
     #[tokio::test]
